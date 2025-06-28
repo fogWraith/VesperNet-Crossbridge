@@ -1,0 +1,13 @@
+{
+    "username": "",
+    "password": "",
+    "server_host": "49.12.195.38",
+    "server_port": 6060,
+    "device": "",
+    "baud_rate": 115200,
+    "emulate_modem": true,
+    "inactivity_timeout": 300,
+    "connection_retries": 3,
+    "debug": false,
+    "log_file": "crossbridge.log"
+}
