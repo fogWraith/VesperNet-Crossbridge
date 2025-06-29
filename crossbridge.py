@@ -22,49 +22,16 @@ import sys
 import time
 import logging
 import serial
-import select
+import json
 
-running = True
+DEBUG = False
+USER_NAME = ""
+USER_PASSWORD = ""
 IS_WINDOWS = sys.platform.startswith('win')
 
-class PPPFrameBuffer:
-    def __init__(self):
-        self.buffer = b""
-        self.frame_start_index = -1
-
-    def add_data(self, data):
-        self.buffer += data
-
-    def extract_frames(self):
-        frames = []
-
-        start_index = 0
-        while True:
-            if start_index >= len(self.buffer):
-                break
-
-            start = self.buffer.find(b'\x7e', start_index)
-            if start == -1:
-                break
-
-            end = self.buffer.find(b'\x7e', start + 1)
-            if end == -1:
-                self.buffer = self.buffer[start:]
-                break
-
-            frame = self.buffer[start:end+1]
-            frames.append(frame)
-
-            start_index = end + 1
-
-        if start_index > 0 and start_index < len(self.buffer):
-            self.buffer = self.buffer[start_index:]
-
-        return frames
+running = True
 
 def load_config(config_path=None):
-    import json
-
     default_config = {
         "username": "",
         "password": "",
@@ -126,7 +93,7 @@ def load_config(config_path=None):
         logging.error(f"Error loading configuration file: {e}")
         return default_config
 
-def signal_handler(signum):
+def signal_handler(signum, frame):
     global running
     logging.info(f"Received signal {signum}, shutting down...")
     running = False
@@ -184,10 +151,7 @@ def emulate_modem(serial_port, server_host, server_port):
                                         connected = True
 
                                         bridge_result = None
-                                        if IS_WINDOWS:
-                                            bridge_result = bridge_ppp_connection_windows(serial_port, socket_connection)
-                                        else:
-                                            bridge_result = bridge_ppp_connection(serial_port, socket_connection)
+                                        bridge_result = bridge_ppp_connection(serial_port, socket_connection)
 
                                         if bridge_result == "COMMAND_MODE":
                                             logging.info("Returned to command mode")
@@ -215,10 +179,7 @@ def emulate_modem(serial_port, server_host, server_port):
                                     in_command_mode = False
 
                                     bridge_result = None
-                                    if IS_WINDOWS:
-                                        bridge_result = bridge_ppp_connection_windows(serial_port, socket_connection)
-                                    else:
-                                        bridge_result = bridge_ppp_connection(serial_port, socket_connection)
+                                    bridge_result = bridge_ppp_connection(serial_port, socket_connection)
                                     
                                     if bridge_result == "COMMAND_MODE":
                                         logging.info("Returned to command mode.")
@@ -266,177 +227,30 @@ def emulate_modem(serial_port, server_host, server_port):
                 pass
 
 def bridge_ppp_connection(serial_port, socket_connection):
-    serial_buffer = PPPFrameBuffer()
-    socket_buffer = PPPFrameBuffer()
-
     try:
-        serial_port.timeout = 0
-        socket_connection.setblocking(False)
-
-        escape_buffer = b""
-        last_activity = time.time()
-        last_data_from_server = time.time()
-        last_data_from_serial = time.time()
-
-        logging.info("Starting PPP data bridging (Unix mode)")
-
-        consecutive_errors = 0
-        max_consecutive_errors = 3
-
-        while running:
-            try:
-                rlist, _, xlist = select.select([serial_port, socket_connection], [], [serial_port, socket_connection], 1.0)
-            except (select.error, ValueError) as e:
-                logging.error(f"Select error: {e}")
-                break
-
-            if xlist:
-                logging.error("Exception condition on socket or serial port")
-                break
-
-            # Client to Server
-            if serial_port in rlist:
-                try:
-                    data = serial_port.read(max(1, serial_port.in_waiting))
-                    if data:
-                        last_activity = time.time()
-                        last_data_from_serial = time.time()
-
-                        escape_buffer += data
-
-                        if b"+++" in escape_buffer[-10:]:
-                            if escape_buffer[-3:] == b"+++":
-                                time.sleep(1)
-                                if serial_port.in_waiting == 0:
-                                    logging.info("Hayes escape sequence detected")
-                                    serial_port.write(b"\r\nOK\r\n")
-                                    serial_port.flush()
-                                    return "COMMAND_MODE"
-
-                        if b"~." in escape_buffer[-10:]:
-                            logging.info("PPP escape sequence detected")
-                            serial_port.write(b"\r\nNO CARRIER\r\n")
-                            serial_port.flush()
-                            break
-
-                        if len(escape_buffer) > 20:
-                            escape_buffer = escape_buffer[-20:]
-
-                        logging.debug(f"Serial → Socket: {len(data)} bytes")
-
-                        serial_buffer.add_data(data)
-                        frames = serial_buffer.extract_frames()
-                        if frames:
-                            for frame in frames:
-                                socket_connection.sendall(frame)
-                        else:
-                            socket_connection.sendall(data)
-                except Exception as e:
-                    logging.error(f"Error: {e}")
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        break
-                    time.sleep(0.5)
-                    continue
-
-            # Server to Client
-            if socket_connection in rlist:
-                try:
-                    data = socket_connection.recv(4096)
-                    if data:
-                        last_activity = time.time()
-                        last_data_from_server = time.time()
-
-                        if (b"\xff\x03\xc0\x21\x05" in data or  # LCP Terminate-Request
-                            b"\xff\x03\xc0\x21\x06" in data):   # LCP Terminate-Ack
-                            logging.info("LCP termination detected")
-                            serial_port.write(data)
-                            serial_port.flush()
-                            time.sleep(0.5)
-                            serial_port.write(b"\r\nNO CARRIER\r\n")
-                            serial_port.flush()
-                            break
-                        
-                        frames = socket_buffer.extract_frames()
-                        if frames:
-                            for frame in frames:
-                                logging.debug(f"Socket → Serial: {len(frame)} bytes frame")
-                                
-                                serial_port.write(frame)
-                                serial_port.flush()
-                        else:
-                            logging.debug(f"Socket → Serial: {len(data)} bytes")
-                            
-                            serial_port.write(data)
-                            serial_port.flush()
-                    else:
-                        logging.info("Server closed connection")
-                        serial_port.write(b"\r\nNO CARRIER\r\n")
-                        serial_port.flush()
-                        break
-                except BlockingIOError:
-                    pass
-                except Exception as e:
-                    logging.error(f"Error reading from socket: {e}")
-                    break
-
-            current_time = time.time()
-
-            if current_time - last_activity > 300:
-                logging.info("Connection timeout due to inactivity (5 minutes)")
-                serial_port.write(b"\r\nNO CARRIER\r\n")
-                serial_port.flush()
-                break
-
-            if current_time - last_data_from_server > 60 and current_time - last_data_from_serial < 30:
-                logging.warning("Server timeout - no data received for 60 seconds")
-                serial_port.write(b"\r\nNO CARRIER\r\n")
-                serial_port.flush()
-                break
-
-    except Exception as e:
-        logging.error(f"Bridge error: {e}", exc_info=True)
-
-    finally:
-        logging.info("Ending PPP bridge session")
-        try:
-            socket_connection.close()
-        except:
-            pass
-
-    return "DISCONNECT"
-
-def bridge_ppp_connection_windows(serial_port, socket_connection):
-    serial_buffer = PPPFrameBuffer()
-    socket_buffer = PPPFrameBuffer()
-
-    try:
+        platform_name = "Windows" if IS_WINDOWS else "Unix"
+        logging.info(f"Starting PPP data bridging ({platform_name} mode)")
+        
         serial_port.timeout = 0.1
         socket_connection.settimeout(0.1)
         
         escape_buffer = b""
         last_activity = time.time()
-        last_data_from_server = time.time()
-        last_data_from_serial = time.time()
         
-        logging.info("Starting PPP data bridging (Windows mode)")
-        logging.info("Sending PPP flag sequence for Windows compatibility")
-        serial_port.write(b'\xff\xff\xff\x7e\xff\x7e\xff\x7e')
-        ipcp_config = b'\xff\x03\x80\x21\x01\x01\x00\x10\x03\x06\x0a\x00\x00\x01\x02\x06\x00\x00\x00\x00'
-        serial_port.write(ipcp_config)
-        serial_port.flush()
-        time.sleep(0.5)
-
         while running:
-            if serial_port.in_waiting > 0:
-                try:
+            data_handled = False
+
+            try:
+                if serial_port.in_waiting > 0:
                     data = serial_port.read(serial_port.in_waiting)
                     if data:
+                        data_handled = True
                         last_activity = time.time()
-                        last_data_from_serial = time.time()
+                        
+                        if DEBUG:
+                            logging.debug(f"Serial->Server: {len(data)} bytes: {data.hex()}")
 
                         escape_buffer += data
-
                         if b"+++" in escape_buffer[-10:]:
                             if escape_buffer[-3:] == b"+++":
                                 time.sleep(1)
@@ -445,41 +259,38 @@ def bridge_ppp_connection_windows(serial_port, socket_connection):
                                     serial_port.write(b"\r\nOK\r\n")
                                     serial_port.flush()
                                     return "COMMAND_MODE"
-
-                        if b"~." in escape_buffer[-10:]:
-                            logging.info("PPP escape sequence detected")
-                            serial_port.write(b"\r\nNO CARRIER\r\n")
-                            serial_port.flush()
-                            break
-
-
+                        
                         if len(escape_buffer) > 20:
                             escape_buffer = escape_buffer[-20:]
-
-                        serial_buffer.add_data(data)
-                        frames = serial_buffer.extract_frames()
-
-                        if frames:
-                            for frame in frames:
-                                logging.debug(f"Serial → Socket: {len(frame)} bytes frame")
-                                socket_connection.sendall(frame)
-                        else:
-                            logging.debug(f"Serial → Socket: {len(data)} bytes raw")
-                            socket_connection.sendall(data)
-                except Exception as e:
-                    logging.error(f"Error reading from serial: {e}")
-                    break
-
+                        
+                        if b'\xff\x03\xc0\x21' in data:
+                            lcp_start = data.find(b'\xff\x03\xc0\x21')
+                            if lcp_start >= 0 and len(data) > lcp_start + 4:
+                                lcp_type = data[lcp_start + 4]
+                                if lcp_type == 1:
+                                    logging.info("Client sent LCP Configure-Request")
+                                elif lcp_type == 2:
+                                    logging.info("Client sent LCP Configure-Ack")
+                                elif lcp_type == 9:
+                                    logging.info("Client sent LCP Echo-Request")
+                        
+                        socket_connection.sendall(data)
+                        
+            except Exception as e:
+                logging.error(f"Error reading from serial port: {e}")
+                break
+            
             try:
                 data = socket_connection.recv(4096)
                 if data:
+                    data_handled = True
                     last_activity = time.time()
-                    last_data_from_server = time.time()
-
-                    socket_buffer.add_data(data)
-
-                    if (b"\xff\x03\xc0\x21\x05" in data or  # LCP Terminate-Request
-                        b"\xff\x03\xc0\x21\x06" in data):   # LCP Terminate-Ack
+                    
+                    if DEBUG:
+                        logging.debug(f"Server->Serial: {len(data)} bytes: {data.hex()}")
+                    
+                    if (b"\xff\x03\xc0\x21\x05" in data or
+                        b"\xff\x03\xc0\x21\x06" in data):
                         logging.info("LCP termination detected")
                         serial_port.write(data)
                         serial_port.flush()
@@ -487,57 +298,55 @@ def bridge_ppp_connection_windows(serial_port, socket_connection):
                         serial_port.write(b"\r\nNO CARRIER\r\n")
                         serial_port.flush()
                         break
-
-                    frames = socket_buffer.extract_frames()
-
-                    if frames:
-                        for frame in frames:
-                            logging.debug(f"Socket → Serial: {len(frame)} bytes frame")
-                            serial_port.write(frame)
-                            serial_port.flush()
-                    else:
-                        logging.debug(f"Socket → Serial: {len(data)} bytes raw")
-                        serial_port.write(data)
-                        serial_port.flush()
-
+                    
+                    if b'\xff\x03\xc0\x21' in data:
+                        lcp_start = data.find(b'\xff\x03\xc0\x21')
+                        if lcp_start >= 0 and len(data) > lcp_start + 4:
+                            lcp_type = data[lcp_start + 4]
+                            if lcp_type == 1:
+                                logging.info("Server sent LCP Configure-Request")
+                            elif lcp_type == 2:
+                                logging.info("Server sent LCP Configure-Ack")
+                            elif lcp_type == 10:
+                                logging.info("Server sent LCP Echo-Reply")
+                    
+                    serial_port.write(data)
+                    serial_port.flush()
+                    
                 elif data == b'':
                     logging.info("Server closed connection")
                     serial_port.write(b"\r\nNO CARRIER\r\n")
                     serial_port.flush()
                     break
+                    
             except socket.timeout:
                 pass
             except BlockingIOError:
                 pass
             except ConnectionError as e:
                 logging.error(f"Socket connection error: {e}")
+                serial_port.write(b"\r\nNO CARRIER\r\n")
+                serial_port.flush()
                 break
             except Exception as e:
-                logging.error(f"Error reading from socket: {e}")
-                break
-
-            current_time = time.time()
-
-            if current_time - last_activity > 300:
-                logging.info("Connection timeout due to inactivity (5 minutes)")
-                serial_port.write(b"\r\nNO CARRIER\r\n")
-                serial_port.flush()
+                logging.error(f"Error reading from server: {e}")
                 break
             
-            if current_time - last_data_from_server > 60 and current_time - last_data_from_serial < 30:
-                logging.warning("Server timeout - no data received for 60 seconds")
+            if time.time() - last_activity > 300:
+                logging.info("Connection timeout due to inactivity")
                 serial_port.write(b"\r\nNO CARRIER\r\n")
                 serial_port.flush()
                 break
 
-            # Windows fix
-            time.sleep(0.01)
+            if not data_handled:
+                time.sleep(0.01)
 
     except Exception as e:
-        logging.error(f"Bridge error: {e}", exc_info=True)
-
+        logging.error(f"Bridge error: {e}")
+        serial_port.write(b"\r\nNO CARRIER\r\n")
+        serial_port.flush()
     finally:
-        logging.info("Ending PPP bridge session (Windows)")
+        logging.info(f"PPP bridge session ended ({platform_name})")
         try:
             socket_connection.close()
         except:
@@ -595,7 +404,7 @@ def main():
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
-    logging.info(f"VesperNet PPP Bridge v1.0 starting")
+    logging.info(f"VesperNet PPP Bridge v1.1 starting")
     logging.info(f"Platform: {sys.platform}")
 
     global USER_NAME, USER_PASSWORD, DEBUG
@@ -673,10 +482,7 @@ def main():
                     except socket.timeout:
                         pass
 
-                    if IS_WINDOWS:
-                        bridge_ppp_connection_windows(serial_port, socket_connection)
-                    else:
-                        bridge_ppp_connection(serial_port, socket_connection)
+                    bridge_ppp_connection(serial_port, socket_connection)
 
                     socket_connection.close()
                     break
