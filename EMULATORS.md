@@ -10,11 +10,58 @@ This guide provides instructions for configuring various emulators to work with 
 4. [Basilisk II (Mac Emulator)](#basilisk-ii-mac-emulator)
 5. [86Box (PC Emulator)](#86box-pc-emulator)
 
-**Note about QEMU, Basilisk II, and SheepShaver:** If your intended guest OS target is Macintosh System / OS, we highly recommend [E-Maculation](https://www.emaculation.com/doku.php)
+**Note about QEMU, Basilisk II, and SheepShaver:**  
+If your intended guest OS target is Macintosh System / OS, we highly recommend [E-Maculation](https://www.emaculation.com/doku.php)
 
 ## QEMU
 
-### Linux
+### Method 1: Unix Domain Socket (Recommended for Linux/macOS)
+
+This method provides the most stable connection and eliminates QEMU rare freezing issues experienced with PTY devices.
+
+#### Linux/macOS
+
+1. Start QEMU with a Unix domain socket:
+   ```bash
+   qemu-system-i386 -serial unix:/tmp/qemu-serial,server,nowait [other options] your_disk_image.img
+   ```
+
+2. Configure the bridge to use the Unix socket:
+   ```json
+   {
+     "device": "unix:/tmp/qemu-serial",
+     "emulate_modem": true
+   }
+   ```
+
+3. Inside the guest OS, configure the serial port (typically COM1/ttyS0) for PPP or dial-up.
+
+### Method 2: TCP Socket (Recommended for Windows)
+
+This method works on all platforms (Linux, macOS, Windows) and allows network-transparent connections.
+
+#### All Platforms
+
+1. Start QEMU with a TCP socket:
+   ```bash
+   qemu-system-i386 -serial tcp:localhost:4555,server,nowait [other options] your_disk_image.img
+   ```
+
+2. Configure the bridge to use the TCP socket:
+   ```json
+   {
+     "device": "tcp:localhost:4555",
+     "emulate_modem": true
+   }
+   ```
+
+3. Inside the guest OS, configure the serial port (typically COM1/ttyS0) for PPP or dial-up.
+
+### Method 3: PTY Device (Legacy Method)
+
+**Note:** This method is provided for compatibility but may cause stability issues with PPP connections. This is based on own experiences.
+
+#### Linux/macOS
 
 1. Start QEMU with a serial port mapped to a PTY:
    ```bash
@@ -28,38 +75,51 @@ This guide provides instructions for configuring various emulators to work with 
 
 3. Configure the bridge to use this PTY device:
    ```json
-   "device": "/dev/pts/3"
+   {
+     "device": "/dev/pts/3",
+     "emulate_modem": true
+   }
    ```
 
 4. Inside the guest OS, configure the serial port (typically COM1/ttyS0) for PPP or dial-up.
 
-### macOS
+### Windows Host Considerations
 
-1. The process is similar to Linux:
-   ```bash
-   qemu-system-i386 -serial pty [other options] your_disk_image.img
-   ```
+For QEMU running on Windows hosts:
 
-2. Note the PTY device path and configure the bridge accordingly.
+#### TCP Socket (Recap, recommended method)
+```cmd
+qemu-system-i386 -serial tcp:localhost:4555,server,nowait [other options] your_disk_image.img
+```
 
-### Windows
+Configuration:
+```json
+{
+  "device": "tcp:localhost:4555",
+  "emulate_modem": true
+}
+```
 
-1. Create a named pipe in Windows (or use com0com for virtual COM ports):
-   ```cmd
-   mkfifo \\.\pipe\qemu-serial
-   ```
+#### Named Pipe (Alternative)
+```cmd
+qemu-system-i386 -serial pipe:qemu-serial [other options] your_disk_image.img
+```
 
-2. Start QEMU with the pipe:
-   ```cmd
-   qemu-system-i386 -serial pipe:qemu-serial [other options] your_disk_image.img
-   ```
+This creates `\\.\pipe\qemu-serial` which can be accessed by the bridge.
 
-   Alternatively, with com0com installed, use:
-   ```cmd
-   qemu-system-i386 -serial com:COM3 [other options] your_disk_image.img
-   ```
+#### Virtual COM Port (com0com)
+With com0com installed:
+```cmd
+qemu-system-i386 -serial com:COM3 [other options] your_disk_image.img
+```
 
-3. Configure the bridge to use the corresponding device.
+Configuration:
+```json
+{
+  "device": "COM3",
+  "emulate_modem": true
+}
+```
 
 ## VirtualBox
 
