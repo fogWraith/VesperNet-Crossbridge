@@ -236,19 +236,26 @@ def bridge_ppp_connection(serial_port, socket_connection):
         
         escape_buffer = b""
         last_activity = time.time()
+        idle_count = 0
         
         while running:
             data_handled = False
 
             try:
                 if serial_port.in_waiting > 0:
-                    data = serial_port.read(serial_port.in_waiting)
+                    if hasattr(serial_port, 'sock'):
+                        data = serial_port.read(4096)
+                    else:
+                        data = serial_port.read(serial_port.in_waiting)
+
                     if data:
                         data_handled = True
                         last_activity = time.time()
                         
                         if DEBUG:
                             logging.debug(f"Serial->Server: {len(data)} bytes: {data.hex()}")
+                        elif len(data) > 100:
+                            logging.info(f"Read {len(data)} bytes from {'socket' if hasattr(serial_port, 'sock') else 'serial'}")
 
                         escape_buffer += data
                         if b"+++" in escape_buffer[-10:]:
@@ -263,7 +270,9 @@ def bridge_ppp_connection(serial_port, socket_connection):
                         if len(escape_buffer) > 20:
                             escape_buffer = escape_buffer[-20:]
                         
-                        if b'\xff\x03\xc0\x21' in data:
+                        if b'\xff\x03\x80\x21' in data:
+                            logging.info("Client sent IPCP packet")
+                        elif b'\xff\x03\xc0\x21' in data:
                             lcp_start = data.find(b'\xff\x03\xc0\x21')
                             if lcp_start >= 0 and len(data) > lcp_start + 4:
                                 lcp_type = data[lcp_start + 4]
@@ -275,6 +284,7 @@ def bridge_ppp_connection(serial_port, socket_connection):
                                     logging.info("Client sent LCP Echo-Request")
                         
                         socket_connection.sendall(data)
+                        time.sleep(0.001)
                         
             except Exception as e:
                 logging.error(f"Error reading from serial port: {e}")
@@ -312,6 +322,7 @@ def bridge_ppp_connection(serial_port, socket_connection):
                     
                     serial_port.write(data)
                     serial_port.flush()
+                    time.sleep(0.001)
                     
                 elif data == b'':
                     logging.info("Server closed connection")
@@ -339,7 +350,16 @@ def bridge_ppp_connection(serial_port, socket_connection):
                 break
 
             if not data_handled:
-                time.sleep(0.01)
+                idle_count += 1
+                if idle_count < 10:
+                    time.sleep(0.01)
+                elif idle_count < 50:
+                    time.sleep(0.02)
+                else:
+                    time.sleep(0.05)
+            else:
+                idle_count = 0
+                time.sleep(0.002)
 
     except Exception as e:
         logging.error(f"Bridge error: {e}")
@@ -354,10 +374,132 @@ def bridge_ppp_connection(serial_port, socket_connection):
 
     return "DISCONNECT"
 
+def open_unix_socket(socket_path, baud_rate):
+    import socket as sock
+    import select
+    
+    class UnixSocketSerial:
+        def __init__(self, socket_path):
+            self.socket_path = socket_path
+            self.sock = None
+            self.timeout = 0.1
+            self._connect()
+        
+        def _connect(self):
+            self.sock = sock.socket(sock.AF_UNIX, sock.SOCK_STREAM)
+            self.sock.connect(self.socket_path)
+            self.sock.settimeout(self.timeout)
+        
+        def read(self, size=1):
+            try:
+                data = self.sock.recv(size)
+                return data if data else b''
+            except sock.timeout:
+                return b''
+            except Exception:
+                return b''
+        
+        def write(self, data):
+            try:
+                return self.sock.send(data)
+            except Exception:
+                return 0
+        
+        def flush(self):
+            pass
+        
+        @property
+        def in_waiting(self):
+            try:
+                ready, _, _ = select.select([self.sock], [], [], 0)
+                if ready:
+                    return 4096
+                return 0
+            except Exception:
+                return 0
+        
+        def close(self):
+            if self.sock:
+                self.sock.close()
+    
+    return UnixSocketSerial(socket_path)
+
+def open_tcp_socket(host, port, baud_rate):
+    import socket as sock
+    
+    class TcpSocketSerial:
+        def __init__(self, host, port):
+            self.host = host
+            self.port = port
+            self.sock = None
+            self.timeout = 0.1
+            self._data_available = False
+            self._connect()
+        
+        def _connect(self):
+            self.sock = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
+            self.sock.connect((self.host, self.port))
+            self.sock.settimeout(self.timeout)
+        
+        def read(self, size=1):
+            try:
+                data = self.sock.recv(size)
+                if data:
+                    self._data_available = False
+                    return data
+                else:
+                    return b''
+            except sock.timeout:
+                self._data_available = False
+                return b''
+            except Exception:
+                self._data_available = False
+                return b''
+        
+        def write(self, data):
+            try:
+                return self.sock.send(data)
+            except Exception:
+                return 0
+        
+        def flush(self):
+            pass
+        
+        @property
+        def in_waiting(self):
+            try:
+                original_timeout = self.sock.gettimeout()
+                self.sock.settimeout(0.001)
+                
+                data = self.sock.recv(1, sock.MSG_PEEK)
+                
+                self.sock.settimeout(original_timeout)
+                
+                if data:
+                    return 4096
+                else:
+                    return 0
+                    
+            except sock.timeout:
+                self.sock.settimeout(original_timeout)
+                return 0
+            except sock.error:
+                try:
+                    self.sock.settimeout(original_timeout)
+                except:
+                    pass
+                return 0
+            except Exception:
+                return 0
+        
+        def close(self):
+            if self.sock:
+                self.sock.close()
+    
+    return TcpSocketSerial(host, port)
+
 def main():
-    """Main program entry point with configuration file support."""
-    parser = argparse.ArgumentParser(description="VesperNet PPP Bridge",
-                                    epilog="Connect vintage systems to VesperNet PPP services")
+    parser = argparse.ArgumentParser(description="VesperNet PPP Bridge", epilog="Connect vintage systems to VesperNet PPP services")
 
     server_group = parser.add_argument_group('Server Connection')
     server_group.add_argument("server_addr", nargs='?', help="Server address in format host:port")
@@ -368,15 +510,12 @@ def main():
     serial_group = parser.add_argument_group('Serial Port')
     serial_group.add_argument("-d", "--device", help="Serial device path")
     serial_group.add_argument("-b", "--baud", type=int, help="Baud rate")
-    serial_group.add_argument("-e", "--emulate", action="store_true", 
-                            help="Emulate a modem with AT commands")
+    serial_group.add_argument("-e", "--emulate", action="store_true", help="Emulate a modem with AT commands")
 
     advanced_group = parser.add_argument_group('Advanced Options')
     advanced_group.add_argument("-c", "--config", help="Path to configuration file")
-    advanced_group.add_argument("-t", "--timeout", type=int,
-                              help="Inactivity timeout in seconds")
-    advanced_group.add_argument("-v", "--verbose", action="store_true",
-                              help="Enable verbose debug logging")
+    advanced_group.add_argument("-t", "--timeout", type=int, help="Inactivity timeout in seconds")
+    advanced_group.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
     advanced_group.add_argument("--log", help="Log file path")
 
     args = parser.parse_args()
@@ -404,7 +543,7 @@ def main():
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
-    logging.info(f"VesperNet PPP Bridge v1.1 starting")
+    logging.info(f"VesperNet PPP Bridge v1.2 starting")
     logging.info(f"Platform: {sys.platform}")
 
     global USER_NAME, USER_PASSWORD, DEBUG
@@ -425,11 +564,6 @@ def main():
         server_host = server_addr
         server_port = config.get('server_port', 6060)
 
-    device = args.device or config.get('device', '')
-    if not device:
-        logging.error("No serial device specified. Use -d/--device option or set 'device' in config file.")
-        return 1
-
     baud_rate = args.baud or config.get('baud_rate', 115200)
     emu_modem = args.emulate or config.get('emulate_modem', False)
     connection_retries = args.retries or config.get('connection_retries', 3)
@@ -439,20 +573,47 @@ def main():
     serial_port = None
 
     try:
-        try:
-            serial_port = serial.Serial(
-                port=device,
-                baudrate=baud_rate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=1.0
-            )
-
-            logging.info(f"Opened {device} at {baud_rate} baud")
-        except serial.SerialException as e:
-            logging.error(f"Failed to open serial port {device}: {e}")
+        device = args.device or config.get('device', '')
+        if not device:
+            logging.error("No serial device specified. Use -d/--device option or set 'device' in config file.")
             return 1
+        
+        if device.startswith('tcp:'):
+            try:
+                _, host_port = device.split(':', 1)
+                if ':' in host_port:
+                    host, port_str = host_port.rsplit(':', 1)
+                    port = int(port_str)
+                else:
+                    host = host_port
+                    port = 23
+                
+                serial_port = open_tcp_socket(host, port, baud_rate)
+                logging.info(f"Opened TCP socket {host}:{port}")
+            except Exception as e:
+                logging.error(f"Failed to open TCP socket {device}: {e}")
+                return 1
+        elif device.startswith('unix:'):
+            try:
+                serial_port = open_unix_socket(device.replace('unix:', ''), baud_rate)
+                logging.info(f"Opened Unix socket {device}")
+            except Exception as e:
+                logging.error(f"Failed to open Unix socket {device}: {e}")
+                return 1
+        else:
+            try:
+                serial_port = serial.Serial(
+                    port=device,
+                    baudrate=baud_rate,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=1.0
+                )
+                logging.info(f"Opened serial port {device} at {baud_rate} baud")
+            except serial.SerialException as e:
+                logging.error(f"Failed to open serial port {device}: {e}")
+                return 1
 
         if emu_modem:
             emulate_modem(serial_port, server_host, server_port)
