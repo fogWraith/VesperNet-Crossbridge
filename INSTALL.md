@@ -7,14 +7,12 @@ The bridge allows vintage computers / emulated environments to connect to the Ve
 
 ### Linux/macOS
 - Python 3.6 or newer
-- Administrative/root access (for PPP interface configuration)
 - Physical serial port or USB-to-Serial adapter
 - or
 - PPP support in the OS (pre-installed on most Linux distributions and macOS)
 
 ### Windows
 - Python 3.6 or newer
-- Administrative privileges
 - Physical serial port or USB-to-Serial adapter
 - or
 - For emulation: Null-modem emulator (com0com, com2tcp, or similar)
