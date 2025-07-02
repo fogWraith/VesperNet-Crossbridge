@@ -6,11 +6,10 @@ This guide provides instructions for configuring various emulators to work with 
 
 1. [QEMU](#qemu)
 2. [VirtualBox](#virtualbox)
-3. [SheepShaver (Mac Emulator)](#sheepshaver-mac-emulator)
-4. [Basilisk II (Mac Emulator)](#basilisk-ii-mac-emulator)
-5. [86Box (PC Emulator)](#86box-pc-emulator)
+3. [Basilisk II (Mac Emulator)](#basilisk-ii-mac-emulator)
+4. [86Box (PC Emulator)](#86box-pc-emulator)
 
-**Note about QEMU, Basilisk II, and SheepShaver:**  
+**Note about QEMU, Basilisk II:**  
 If your intended guest OS target is Macintosh System / OS, we highly recommend [E-Maculation](https://www.emaculation.com/doku.php)
 
 ## QEMU
@@ -145,30 +144,6 @@ Configuration:
    ```
 
 7. Inside the guest OS, configure the serial port (COM1) for PPP or dial-up
-
-## SheepShaver (Mac Emulator)
-
-1. Open the SheepShaver settings before launching
-
-2. In the "Serial/Network" tab:
-   - Set "Modem Port" to: 
-     - Linux/macOS: `/dev/ptmx` (for dynamic PTY allocation)
-     - Windows: `COM3` (or your virtual COM port)
-
-3. Click "Save" and start SheepShaver
-
-4. For Linux/macOS, check which PTY device was created:
-   ```bash
-   ls -la /dev/pts/
-   ```
-   Look for a recently created device with appropriate permissions
-
-5. Configure the bridge to use this device:
-   ```json
-   "device": "/dev/pts/3"  # Replace with your detected device
-   ```
-
-6. In MacOS, configure the PPP or modem software to use the Modem Port
 
 ## Basilisk II (Mac Emulator)
 
