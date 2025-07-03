@@ -21,7 +21,7 @@ import argparse
 import sys
 import time
 import logging
-import serial
+import serial as pyserial
 import json
 
 DEBUG = False
@@ -110,17 +110,53 @@ def emulate_modem(serial_port, server_host, server_port):
         connected = False
         in_command_mode = True
         command_buffer = b""
-
+        connection_established = False
+        dial_count = 0
+        ppp_data_received = False
+        first_connect_time = 0
+        
         while running:
             if in_command_mode:
                 if serial_port.in_waiting > 0:
                     data = serial_port.read(serial_port.in_waiting)
                     command_buffer += data
 
+                    if connection_established and not ppp_data_received:
+                        if b'~}' in data or b'\x7e' in data or b'\xff\x03' in data:
+                            logging.info("PPP data detected in command mode - client starting PPP negotiation")
+                            ppp_data_received = True
+                            
+                            if socket_connection:
+                                socket_connection.sendall(data)
+                                in_command_mode = False
+                                logging.info("Entering PPP data mode due to client-initiated PPP negotiation")
+                                
+                                bridge_result = bridge_ppp_connection(serial_port, socket_connection)
+                                
+                                if bridge_result == "COMMAND_MODE":
+                                    logging.info("Returned to command mode")
+                                    in_command_mode = True
+                                    ppp_data_received = False
+                                else:
+                                    if socket_connection:
+                                        socket_connection.close()
+                                        socket_connection = None
+                                    connected = False
+                                    connection_established = False
+                                    dial_count = 0
+                                    ppp_data_received = False
+                                    first_connect_time = 0
+                                    return
+                            continue
+
                     if b"\r" in command_buffer:
                         command_parts = command_buffer.split(b"\r")
                         for i, cmd_bytes in enumerate(command_parts[:-1]):
                             cmd = cmd_bytes.strip().decode("ascii", errors="ignore").upper()
+                            
+                            if not cmd:
+                                continue
+                                
                             logging.info(f"Modem command: {cmd}")
 
                             if "AT" in cmd:
@@ -131,46 +167,80 @@ def emulate_modem(serial_port, server_host, server_port):
                                         logging.info(f"Extracted AT command from noise: {cmd}")
 
                                 if cmd.startswith("ATD"):
-                                    serial_port.write(b"\r\nCONNECTING\r\n")
-                                    serial_port.flush()
-
-                                    try:
-                                        socket_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                                        socket_connection.settimeout(30)
-                                        socket_connection.connect(server_address)
-
-                                        auth_string = f"{USER_NAME}:{USER_PASSWORD}\r\n".encode()
-                                        socket_connection.sendall(auth_string)
-                                        logging.info(f"Sent authentication: {USER_NAME}:****")
-
-                                        time.sleep(2)
-
-                                        serial_port.write(b"\r\nCONNECT 33600\r\n")
+                                    dial_count += 1
+                                    logging.info(f"Dial attempt #{dial_count}: {cmd}")
+                                    
+                                    if not connection_established:
+                                        serial_port.write(b"\r\nCONNECTING\r\n")
                                         serial_port.flush()
-                                        in_command_mode = False
-                                        connected = True
 
-                                        bridge_result = None
-                                        bridge_result = bridge_ppp_connection(serial_port, socket_connection)
+                                        try:
+                                            if socket_connection:
+                                                socket_connection.close()
+                                            
+                                            socket_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                            socket_connection.settimeout(30)
+                                            socket_connection.connect(server_address)
 
-                                        if bridge_result == "COMMAND_MODE":
-                                            logging.info("Returned to command mode")
-                                            in_command_mode = True
+                                            auth_string = f"{USER_NAME}:{USER_PASSWORD}\r\n".encode()
+                                            socket_connection.sendall(auth_string)
+                                            logging.info(f"Sent authentication: {USER_NAME}:****")
+
+                                            time.sleep(1)
+
+                                            socket_connection.settimeout(2)
+                                            try:
+                                                response = socket_connection.recv(1024)
+                                                if b"Authentication failed" in response:
+                                                    logging.error("Authentication failed")
+                                                    serial_port.write(b"\r\nNO CARRIER\r\n")
+                                                    serial_port.flush()
+                                                    socket_connection.close()
+                                                    socket_connection = None
+                                                    continue
+                                            except socket.timeout:
+                                                pass
+
+                                            serial_port.write(b"\r\nCONNECT 33600\r\n")
+                                            serial_port.flush()
+                                            connection_established = True
                                             connected = True
-                                        else:
+                                            first_connect_time = time.time()
+                                            
+                                            logging.info("Connection established, monitoring for PPP data or second dial")
+
+                                        except Exception as e:
+                                            logging.error(f"Connection failed: {e}")
+                                            serial_port.write(b"\r\nNO CARRIER\r\n")
+                                            serial_port.flush()
                                             if socket_connection:
                                                 socket_connection.close()
                                                 socket_connection = None
-                                            connected = False
-                                            return
+                                            connection_established = False
+                                            dial_count = 0
 
-                                    except Exception as e:
-                                        logging.error(f"Connection failed: {e}")
-                                        serial_port.write(b"\r\nNO CARRIER\r\n")
+                                    else:
+                                        logging.info("Second dial detected - starting PPP data mode")
+                                        serial_port.write(b"\r\nCONNECT 33600\r\n")
                                         serial_port.flush()
+                                        in_command_mode = False
+
                                         if socket_connection:
-                                            socket_connection.close()
-                                            socket_connection = None
+                                            bridge_result = bridge_ppp_connection(serial_port, socket_connection)
+
+                                            if bridge_result == "COMMAND_MODE":
+                                                logging.info("Returned to command mode")
+                                                in_command_mode = True
+                                            else:
+                                                if socket_connection:
+                                                    socket_connection.close()
+                                                    socket_connection = None
+                                                connected = False
+                                                connection_established = False
+                                                dial_count = 0
+                                                ppp_data_received = False
+                                                first_connect_time = 0
+                                                return
 
                                 elif cmd == "ATO" and connected and socket_connection:
                                     logging.info("ATO command - returning to online mode")
@@ -178,45 +248,110 @@ def emulate_modem(serial_port, server_host, server_port):
                                     serial_port.flush()
                                     in_command_mode = False
 
-                                    bridge_result = None
                                     bridge_result = bridge_ppp_connection(serial_port, socket_connection)
                                     
                                     if bridge_result == "COMMAND_MODE":
-                                        logging.info("Returned to command mode.")
+                                        logging.info("Returned to command mode")
                                         in_command_mode = True
                                     else:
                                         if socket_connection:
                                             socket_connection.close()
                                             socket_connection = None
                                         connected = False
+                                        connection_established = False
+                                        dial_count = 0
+                                        ppp_data_received = False
+                                        first_connect_time = 0
                                         return
 
                                 elif cmd == "ATH" or cmd == "ATH0":
+                                    logging.info("Hangup command received")
                                     serial_port.write(b"\r\nOK\r\n")
                                     serial_port.flush()
                                     if socket_connection:
                                         socket_connection.close()
                                         socket_connection = None
-                                        connected = False
+                                    connected = False
+                                    connection_established = False
+                                    dial_count = 0
+                                    ppp_data_received = False
+                                    first_connect_time = 0
+
+                                elif cmd in ["ATZ", "ATM1L1", "ATX3", "ATE1", "ATE0", "ATQ0", "ATV1"]:
+                                    logging.debug(f"Modem init command: {cmd}")
+                                    serial_port.write(b"\r\nOK\r\n")
+                                    serial_port.flush()
+
+                                elif cmd.startswith("ATE"):
+                                    logging.debug(f"Echo control command: {cmd}")
+                                    serial_port.write(b"\r\nOK\r\n")
+                                    serial_port.flush()
 
                                 else:
+                                    logging.debug(f"Generic AT command: {cmd}")
                                     serial_port.write(b"\r\nOK\r\n")
                                     serial_port.flush()
 
                             else:
-                                serial_port.write(b"\r\nERROR\r\n")
-                                serial_port.flush()
+                                if connection_established and (b'~}' in cmd.encode() or b'\x7e' in cmd.encode()):
+                                    logging.info("PPP-like data in non-AT command - treating as PPP start")
+                                    ppp_data_received = True
+                                    
+                                    if socket_connection:
+                                        socket_connection.sendall(cmd_bytes + b'\r')
+                                        in_command_mode = False
+                                        
+                                        bridge_result = bridge_ppp_connection(serial_port, socket_connection)
+                                        
+                                        if bridge_result == "COMMAND_MODE":
+                                            in_command_mode = True
+                                            ppp_data_received = False
+                                        else:
+                                            if socket_connection:
+                                                socket_connection.close()
+                                                socket_connection = None
+                                            connected = False
+                                            connection_established = False
+                                            dial_count = 0
+                                            ppp_data_received = False
+                                            first_connect_time = 0
+                                            return
+                                else:
+                                    logging.warning(f"Non-AT command received: {repr(cmd)}")
+                                    serial_port.write(b"\r\nERROR\r\n")
+                                    serial_port.flush()
 
                         command_buffer = command_parts[-1]
+
+                if (connection_established and not ppp_data_received and 
+                    first_connect_time > 0 and (time.time() - first_connect_time) > 10):
+                    
+                    logging.info("Timeout waiting for second dial - assuming client wants immediate PPP mode")
+                    in_command_mode = False
+                    ppp_data_received = True
+                    
+                    if socket_connection:
+                        bridge_result = bridge_ppp_connection(serial_port, socket_connection)
+                        
+                        if bridge_result == "COMMAND_MODE":
+                            in_command_mode = True
+                            ppp_data_received = False
+                        else:
+                            if socket_connection:
+                                socket_connection.close()
+                                socket_connection = None
+                            connected = False
+                            connection_established = False
+                            dial_count = 0
+                            ppp_data_received = False
+                            first_connect_time = 0
+                            return
 
                 time.sleep(0.1)
 
             else:
+                logging.warning("Unexpected transition to data mode (report this to fogWraith)")
                 in_command_mode = True
-                if socket_connection:
-                    socket_connection.close()
-                    socket_connection = None
-                    connected = False
 
     except Exception as e:
         logging.error(f"Modem emulation error: {e}", exc_info=True)
@@ -237,9 +372,13 @@ def bridge_ppp_connection(serial_port, socket_connection):
         escape_buffer = b""
         last_activity = time.time()
         idle_count = 0
+
+        consecutive_errors = 0
+        max_consecutive_errors = 5
         
         while running:
             data_handled = False
+            current_time = time.time()
 
             try:
                 if serial_port.in_waiting > 0:
@@ -250,7 +389,8 @@ def bridge_ppp_connection(serial_port, socket_connection):
 
                     if data:
                         data_handled = True
-                        last_activity = time.time()
+                        last_activity = current_time
+                        consecutive_errors = 0
                         
                         if DEBUG:
                             logging.debug(f"Serial->Server: {len(data)} bytes: {data.hex()}")
@@ -258,43 +398,58 @@ def bridge_ppp_connection(serial_port, socket_connection):
                             logging.info(f"Read {len(data)} bytes from {'socket' if hasattr(serial_port, 'sock') else 'serial'}")
 
                         escape_buffer += data
-                        if b"+++" in escape_buffer[-10:]:
-                            if escape_buffer[-3:] == b"+++":
-                                time.sleep(1)
-                                if serial_port.in_waiting == 0:
-                                    logging.info("Hayes escape sequence detected")
-                                    serial_port.write(b"\r\nOK\r\n")
-                                    serial_port.flush()
-                                    return "COMMAND_MODE"
-                        
                         if len(escape_buffer) > 20:
                             escape_buffer = escape_buffer[-20:]
+
+                        if b"+++" in escape_buffer[-10:]:
+                            plus_index = escape_buffer.rfind(b"+++")
+                            if plus_index >= 0:
+                                remaining = escape_buffer[plus_index + 3:]
+                                if len(remaining) == 0:
+                                    time.sleep(1)
+                                    if serial_port.in_waiting == 0:
+                                        logging.info("Hayes escape sequence detected")
+                                        serial_port.write(b"\r\nOK\r\n")
+                                        serial_port.flush()
+                                        return "COMMAND_MODE"
                         
-                        if b'\xff\x03\x80\x21' in data:
-                            logging.info("Client sent IPCP packet")
-                        elif b'\xff\x03\xc0\x21' in data:
-                            lcp_start = data.find(b'\xff\x03\xc0\x21')
-                            if lcp_start >= 0 and len(data) > lcp_start + 4:
-                                lcp_type = data[lcp_start + 4]
-                                if lcp_type == 1:
-                                    logging.info("Client sent LCP Configure-Request")
-                                elif lcp_type == 2:
-                                    logging.info("Client sent LCP Configure-Ack")
-                                elif lcp_type == 9:
-                                    logging.info("Client sent LCP Echo-Request")
+                        if DEBUG:
+                            if b'\xff\x03\x80\x21' in data:
+                                logging.info("Client sent IPCP packet")
+                            elif b'\xff\x03\xc0\x21' in data:
+                                lcp_start = data.find(b'\xff\x03\xc0\x21')
+                                if lcp_start >= 0 and len(data) > lcp_start + 4:
+                                    lcp_type = data[lcp_start + 4]
+                                    if lcp_type == 1:
+                                        logging.info("Client sent LCP Configure-Request")
+                                    elif lcp_type == 2:
+                                        logging.info("Client sent LCP Configure-Ack")
+                                    elif lcp_type == 9:
+                                        logging.info("Client sent LCP Echo-Request")
                         
                         socket_connection.sendall(data)
                         time.sleep(0.001)
                         
+            except pyserial.SerialTimeoutException:
+                pass
+            except pyserial.SerialException as e:
+                consecutive_errors += 1
+                logging.error(f"Serial port error ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                if consecutive_errors >= max_consecutive_errors:
+                    logging.error("Too many serial errors, disconnecting")
+                    break
             except Exception as e:
-                logging.error(f"Error reading from serial port: {e}")
-                break
+                consecutive_errors += 1
+                logging.error(f"Error reading from serial port ({consecutive_errors}): {e}")
+                if consecutive_errors >= max_consecutive_errors:
+                    break
             
             try:
                 data = socket_connection.recv(4096)
                 if data:
                     data_handled = True
-                    last_activity = time.time()
+                    last_activity = current_time
+                    consecutive_errors = 0
                     
                     if DEBUG:
                         logging.debug(f"Server->Serial: {len(data)} bytes: {data.hex()}")
@@ -309,16 +464,17 @@ def bridge_ppp_connection(serial_port, socket_connection):
                         serial_port.flush()
                         break
                     
-                    if b'\xff\x03\xc0\x21' in data:
-                        lcp_start = data.find(b'\xff\x03\xc0\x21')
-                        if lcp_start >= 0 and len(data) > lcp_start + 4:
-                            lcp_type = data[lcp_start + 4]
-                            if lcp_type == 1:
-                                logging.info("Server sent LCP Configure-Request")
-                            elif lcp_type == 2:
-                                logging.info("Server sent LCP Configure-Ack")
-                            elif lcp_type == 10:
-                                logging.info("Server sent LCP Echo-Reply")
+                    if DEBUG:
+                        if b'\xff\x03\xc0\x21' in data:
+                            lcp_start = data.find(b'\xff\x03\xc0\x21')
+                            if lcp_start >= 0 and len(data) > lcp_start + 4:
+                                lcp_type = data[lcp_start + 4]
+                                if lcp_type == 1:
+                                    logging.info("Server sent LCP Configure-Request")
+                                elif lcp_type == 2:
+                                    logging.info("Server sent LCP Configure-Ack")
+                                elif lcp_type == 10:
+                                    logging.info("Server sent LCP Echo-Reply")
                     
                     serial_port.write(data)
                     serial_port.flush()
@@ -332,18 +488,18 @@ def bridge_ppp_connection(serial_port, socket_connection):
                     
             except socket.timeout:
                 pass
-            except BlockingIOError:
-                pass
             except ConnectionError as e:
-                logging.error(f"Socket connection error: {e}")
+                logging.error(f"Server connection lost: {e}")
                 serial_port.write(b"\r\nNO CARRIER\r\n")
                 serial_port.flush()
                 break
             except Exception as e:
-                logging.error(f"Error reading from server: {e}")
-                break
+                consecutive_errors += 1
+                logging.error(f"Error reading from server ({consecutive_errors}): {e}")
+                if consecutive_errors >= max_consecutive_errors:
+                    break
             
-            if time.time() - last_activity > 300:
+            if current_time - last_activity > 300:
                 logging.info("Connection timeout due to inactivity")
                 serial_port.write(b"\r\nNO CARRIER\r\n")
                 serial_port.flush()
@@ -363,8 +519,11 @@ def bridge_ppp_connection(serial_port, socket_connection):
 
     except Exception as e:
         logging.error(f"Bridge error: {e}")
-        serial_port.write(b"\r\nNO CARRIER\r\n")
-        serial_port.flush()
+        try:
+            serial_port.write(b"\r\nNO CARRIER\r\n")
+            serial_port.flush()
+        except:
+            pass
     finally:
         logging.info(f"PPP bridge session ended ({platform_name})")
         try:
@@ -373,6 +532,94 @@ def bridge_ppp_connection(serial_port, socket_connection):
             pass
 
     return "DISCONNECT"
+
+def check_serial(device):
+    if device.startswith(('tcp:', 'unix:')):
+        return True
+    
+    if IS_WINDOWS:
+        return True
+    
+    try:
+        import subprocess
+        result = subprocess.run(['lsof', device], capture_output=True, text=True, timeout=5)
+        
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.strip().split('\n')[1:]
+            processes = []
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 2:
+                    processes.append(f"{parts[0]} (PID: {parts[1]})")
+            
+            if processes:
+                logging.warning(f"Serial port {device} appears to be in use by: {', '.join(processes)}")
+                return False
+        
+        return True
+        
+    except subprocess.TimeoutExpired:
+        logging.debug("lsof check timed out")
+        return True
+    except FileNotFoundError:
+        logging.debug("lsof not available")
+        return True
+    except Exception as e:
+        logging.debug(f"Could not check port usage: {e}")
+        return True
+    
+def open_serial(device, baud_rate):
+    try:
+        if not device.startswith(('tcp:', 'unix:')):
+            if not os.path.exists(device):
+                if IS_WINDOWS:
+                    if not device.upper().startswith('COM'):
+                        raise pyserial.SerialException(f"Device {device} does not exist. Windows COM ports should be like COM1, COM2, etc.")
+                else:
+                    raise pyserial.SerialException(f"Device {device} does not exist. Check device path and connection.")
+        
+        serial_port = pyserial.Serial(
+            port=device,
+            baudrate=baud_rate,
+            bytesize=pyserial.EIGHTBITS,
+            parity=pyserial.PARITY_NONE,
+            stopbits=pyserial.STOPBITS_ONE,
+            timeout=1.0
+        )
+        
+        logging.info(f"Successfully opened serial port {device} at {baud_rate} baud")
+        return serial_port
+        
+    except pyserial.SerialException as e:
+        error_msg = str(e).lower()
+        
+        if "permission denied" in error_msg or "access is denied" in error_msg:
+            if IS_WINDOWS:
+                raise pyserial.SerialException(f"Permission denied accessing {device}. Another program may be using this port or you need Administrator privileges")
+            else:
+                raise pyserial.SerialException(f"Permission denied accessing {device}. Another program may be using this port or your user potentially needs to be in the 'dialout' group")
+        
+        elif "device or resource busy" in error_msg or "resource busy" in error_msg:
+            raise pyserial.SerialException(f"Device {device} is busy. Another program is currently using this serial port. Close other serial programs and try again")
+        
+        elif "no such file or directory" in error_msg:
+            if IS_WINDOWS:
+                try:
+                    import serial.tools.list_ports
+                    available_ports = [port.device for port in serial.tools.list_ports.comports()]
+                    ports_msg = f"Available ports: {', '.join(available_ports)}" if available_ports else "No COM ports detected"
+                except:
+                    ports_msg = "Check Device Manager for available COM ports"
+                
+                raise pyserial.SerialException(f"COM port {device} not found. {ports_msg}")
+            else:
+                raise pyserial.SerialException(f"Device {device} not found. Check connection and device path")
+        
+        elif "invalid argument" in error_msg or "invalid baud rate" in error_msg:
+            raise pyserial.SerialException(f"Invalid configuration for {device}. Try a different baud rate (9600, 19200, 38400, 57600, 115200, etc.)")
+        
+        else:
+            raise pyserial.SerialException(f"Failed to open {device}: {e}")
 
 def open_unix_socket(socket_path, baud_rate):
     import socket as sock
@@ -543,7 +790,7 @@ def main():
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
-    logging.info(f"VesperNet PPP Bridge v1.2 starting")
+    logging.info(f"VesperNet PPP Bridge v1.3 starting")
     logging.info(f"Platform: {sys.platform}")
 
     global USER_NAME, USER_PASSWORD, DEBUG
@@ -578,6 +825,9 @@ def main():
             logging.error("No serial device specified. Use -d/--device option or set 'device' in config file.")
             return 1
         
+        if not check_serial(device):
+            logging.warning("Serial port appears to be in use by another program. Close other serial programs and try again.")
+        
         if device.startswith('tcp:'):
             try:
                 _, host_port = device.split(':', 1)
@@ -588,31 +838,28 @@ def main():
                     host = host_port
                     port = 23
                 
+                logging.info(f"Connecting to TCP socket {host}:{port}...")
                 serial_port = open_tcp_socket(host, port, baud_rate)
-                logging.info(f"Opened TCP socket {host}:{port}")
+                logging.info(f"Successfully connected to TCP socket {host}:{port}")
             except Exception as e:
                 logging.error(f"Failed to open TCP socket {device}: {e}")
                 return 1
+            
         elif device.startswith('unix:'):
             try:
-                serial_port = open_unix_socket(device.replace('unix:', ''), baud_rate)
-                logging.info(f"Opened Unix socket {device}")
+                socket_path = device.replace('unix:', '')
+                logging.info(f"Connecting to Unix socket {socket_path}...")
+                serial_port = open_unix_socket(socket_path, baud_rate)
+                logging.info(f"Successfully connected to Unix socket {socket_path}")
             except Exception as e:
                 logging.error(f"Failed to open Unix socket {device}: {e}")
                 return 1
         else:
             try:
-                serial_port = serial.Serial(
-                    port=device,
-                    baudrate=baud_rate,
-                    bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE,
-                    timeout=1.0
-                )
-                logging.info(f"Opened serial port {device} at {baud_rate} baud")
-            except serial.SerialException as e:
-                logging.error(f"Failed to open serial port {device}: {e}")
+                logging.info(f"Opening serial port {device} at {baud_rate} baud...")
+                serial_port = open_serial(device, baud_rate)
+            except pyserial.SerialException as e:
+                logging.error(f"{e}")
                 return 1
 
         if emu_modem:
