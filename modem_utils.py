@@ -23,7 +23,7 @@ DEBUG = False
 IS_WINDOWS = sys.platform.startswith('win')
 
 class HayesModem:
-    def __init__(self, username, password, debug=False, connect_speed=None):
+    def __init__(self, username, password, debug=False, connect_speed=None, baud_rate=None):
         self.username = username
         self.password = password
         self.debug = debug
@@ -31,11 +31,20 @@ class HayesModem:
         DEBUG = debug
         self.connect_speed = connect_speed or 33600
 
+        self.dte_speed = baud_rate or 38400
+        self.dce_speed = None
+        self.negotiated_speed = None
+        self.modem_type = None
+
         self.socket_connection = None
         self.connected = False
         self.in_command_mode = True
         self.command_buffer = b""
         self.disconnecting = False
+
+        self.connection_type = "V.32bis"
+        self.compression_enabled = True
+        self.error_correction = True
         
     def emulate_modem(self, serial_port, server_host, server_port):
         try:
@@ -60,6 +69,57 @@ class HayesModem:
             logging.error(f"Modem emulation error: {e}", exc_info=True)
         finally:
             self._cleanup_connection()
+    
+    def _wait_for_speed_negotiation(self, timeout=15):
+        try:
+            self.socket_connection.settimeout(0.5)
+            buffer = b""
+            start_time = time.time()
+            
+            logging.info("Waiting for speed negotiation from VesperNet ...")
+            
+            while time.time() - start_time < timeout:
+                try:
+                    data = self.socket_connection.recv(1024)
+                    if not data:
+                        break
+                        
+                    buffer += data
+                    
+                    if b"\n" in buffer:
+                        lines = buffer.split(b"\n")
+                        for line in lines[:-1]:
+                            line_str = line.decode('ascii', errors='ignore')
+                            
+                            if line_str.startswith("NEGOTIATE:"):
+                                try:
+                                    parts = line_str.split(":")
+                                    if len(parts) >= 3:
+                                        self.negotiated_speed = int(parts[1])
+                                        self.modem_type = parts[2]
+                                        
+                                        logging.info(f"Received speed negotiation: {self.negotiated_speed} bps ({self.modem_type})")
+                                        return True
+                                except (ValueError, IndexError) as e:
+                                    logging.debug(f"Failed to parse negotiation: {e}")
+                                    
+                            elif line_str.startswith("ERROR:"):
+                                logging.error(f"PPP daemon reported error: {line_str}")
+                                return False
+                        
+                        buffer = lines[-1]
+                        
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    logging.debug(f"Error reading negotiation: {e}")
+                    break
+                    
+        except Exception as e:
+            logging.debug(f"Error in speed negotiation: {e}")
+            
+        logging.warning("No speed negotiation received from PPP daemon")
+        return False
     
     def _handle_command_mode(self, serial_port, server_address):
         if serial_port.in_waiting > 0:
@@ -112,6 +172,41 @@ class HayesModem:
         logging.info("Connection ended - ready for new commands")
     
     def _process_at_command(self, cmd, serial_port, server_address):
+        if cmd in ["ATI", "ATI0"]:
+            serial_port.write(b"\r\nVesperNet Hayes Compatible Modem v2.0\r\n")
+            serial_port.flush()
+            return
+            
+        elif cmd == "ATI1":
+            if self.connected and self.negotiated_speed:
+                status = f"\r\nConnected at {self.negotiated_speed} bps ({self.modem_type})\r\n".encode()
+                status += f"DTE Speed: {self.dte_speed} bps\r\n".encode()
+                status += f"DCE Speed: {self.dce_speed} bps\r\n".encode()
+            else:
+                status = b"\r\nNot connected\r\n"
+            serial_port.write(status)
+            serial_port.flush()
+            return
+            
+        elif cmd == "ATI4":
+            if self.negotiated_speed:
+                settings = f"\r\nLine Speed: {self.negotiated_speed} bps\r\n".encode()
+                settings += f"Protocol: {self.modem_type}\r\n".encode()
+            else:
+                settings = b"\r\nNo active connection\r\n"
+            serial_port.write(settings)
+            serial_port.flush()
+            return
+            
+        elif cmd.startswith("AT*N"):
+            if self.negotiated_speed:
+                negotiation = f"\r\n*N: {self.negotiated_speed} bps via {self.modem_type}\r\n".encode()
+            else:
+                negotiation = b"\r\n*N: No negotiation\r\n"
+            serial_port.write(negotiation)
+            serial_port.flush()
+            return
+        
         if cmd.startswith("ATD"):
             self._handle_dial_command(cmd, serial_port, server_address)
             
@@ -133,9 +228,6 @@ class HayesModem:
         self._cleanup_connection()
         
         try:
-            serial_port.write(b"\r\nCONNECTING\r\n")
-            serial_port.flush()
-
             self.socket_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket_connection.settimeout(30)
             self.socket_connection.connect(server_address)
@@ -158,17 +250,26 @@ class HayesModem:
             except socket.timeout:
                 pass
 
-            connect_message = f"\r\nCONNECT {self.connect_speed}\r\n".encode()
+            if self._wait_for_speed_negotiation():
+                logging.info(f"Speed negotiation successful: {self.negotiated_speed} bps ({self.modem_type})")
+            else:
+                logging.warning("Speed negotiation failed, using fallback")
+                self.negotiated_speed = self.connect_speed
+                self.modem_type = "V.34+"
+
+            self._emulate_modem_handshake(serial_port)
+            
+            connect_message = self._get_connect_message()
             serial_port.write(connect_message)
             serial_port.flush()
+
             self.connected = True
             self.in_command_mode = False
             self.disconnecting = False
             
-            logging.info("Dial successful - entering PPP data mode")
+            logging.info(f"Dial successful - DTE: {self.dte_speed}, DCE: {self.dce_speed}, Negotiated: {self.negotiated_speed} ({self.modem_type})")
             
             bridge_result = self._bridge_ppp_connection(serial_port)
-            
             self._handle_connection_ended(serial_port, bridge_result)
 
         except Exception as e:
@@ -176,6 +277,124 @@ class HayesModem:
             serial_port.write(b"\r\nNO CARRIER\r\n")
             serial_port.flush()
             self._cleanup_connection()
+    
+    def _emulate_modem_handshake(self, serial_port):
+        try:
+            if self.modem_type and "ISDN" in self.modem_type:
+                serial_port.write(b"\r\nDialing ISDN number...\r\n")
+                serial_port.flush()
+                time.sleep(0.8)
+                
+                serial_port.write(b"\r\nISDN call setup...\r\n")
+                serial_port.flush()
+                time.sleep(1.0)
+                
+                serial_port.write(b"\r\nB-channel connected\r\n")
+                serial_port.flush()
+                time.sleep(0.5)
+            else:
+                serial_port.write(b"\r\nDialing...\r\n")
+                serial_port.flush()
+                time.sleep(1.0)
+                
+                serial_port.write(b"\r\nRinging...\r\n")
+                serial_port.flush()
+                time.sleep(1.5)
+                
+                serial_port.write(b"\r\nCarrier detected\r\n")
+                serial_port.flush()
+                time.sleep(0.8)
+
+            if self.negotiated_speed and self.modem_type:
+                if "ISDN" in self.modem_type:
+                    if "64" in self.modem_type:
+                        serial_port.write(b"\r\nProtocol: ISDN 64k (1B)\r\n")
+                    elif "112" in self.modem_type:
+                        serial_port.write(b"\r\nProtocol: ISDN 112k (2B)\r\n")
+                    elif "128" in self.modem_type:
+                        serial_port.write(b"\r\nProtocol: ISDN 128k (2B+D)\r\n")
+                    elif "192" in self.modem_type:
+                        serial_port.write(b"\r\nProtocol: ISDN 192k (3B)\r\n")
+                    elif "256" in self.modem_type:
+                        serial_port.write(b"\r\nProtocol: ISDN 256k (4B)\r\n")
+                    else:
+                        serial_port.write(f"\r\nProtocol: {self.modem_type}\r\n".encode())
+                    
+                    serial_port.flush()
+                    time.sleep(0.5)
+                    
+                    serial_port.write(b"\r\nCompression: STAC/LZS\r\n")
+                    serial_port.flush()
+                    time.sleep(0.3)
+                    
+                    serial_port.write(b"\r\nError Correction: LAPD\r\n")
+                    serial_port.flush()
+                    time.sleep(0.3)
+                else:
+                    if self.modem_type == "V.32bis":
+                        serial_port.write(b"\r\nProtocol: V.32bis\r\n")
+                    elif self.modem_type == "V.34":
+                        serial_port.write(b"\r\nProtocol: V.34\r\n")
+                    elif self.modem_type == "V.34+":
+                        serial_port.write(b"\r\nProtocol: V.34+\r\n")
+                    elif self.modem_type == "V.90":
+                        serial_port.write(b"\r\nProtocol: V.90\r\n")
+                    else:
+                        serial_port.write(f"\r\nProtocol: {self.modem_type}\r\n".encode())
+                    
+                    serial_port.flush()
+                    time.sleep(0.5)
+                    
+                    if self.negotiated_speed >= 9600:
+                        serial_port.write(b"\r\nCompression: V.42bis\r\n")
+                        serial_port.flush()
+                        time.sleep(0.3)
+                        
+                    if self.negotiated_speed >= 2400:
+                        serial_port.write(b"\r\nError Correction: LAP-M\r\n")
+                        serial_port.flush()
+                        time.sleep(0.3)
+                
+                self.dce_speed = self.negotiated_speed
+                
+            else:
+                serial_port.write(b"\r\nProtocol: Unknown\r\n")
+                serial_port.flush()
+                self.dce_speed = self.connect_speed
+                
+        except Exception as e:
+            logging.debug(f"Error in handshake emulation: {e}")
+    
+    def _get_connect_message(self):
+        if self.negotiated_speed and self.modem_type:
+            if "ISDN" in self.modem_type:
+                if "64" in self.modem_type:
+                    return b"\r\nCONNECT ISDN 64000\r\n"
+                elif "112" in self.modem_type:
+                    return b"\r\nCONNECT ISDN 112000/2B\r\n"
+                elif "128" in self.modem_type:
+                    return b"\r\nCONNECT ISDN 128000/2B+D\r\n"
+                elif "192" in self.modem_type:
+                    return b"\r\nCONNECT ISDN 192000/3B\r\n"
+                elif "256" in self.modem_type:
+                    return b"\r\nCONNECT ISDN 256000/4B\r\n"
+                else:
+                    return f"\r\nCONNECT ISDN {self.negotiated_speed}\r\n".encode()
+            else:
+                if self.negotiated_speed <= 2400:
+                    return f"\r\nCONNECT {self.negotiated_speed}\r\n".encode()
+                elif self.negotiated_speed <= 9600:
+                    return f"\r\nCONNECT {self.negotiated_speed}/ARQ\r\n".encode()
+                elif self.negotiated_speed <= 14400:
+                    return f"\r\nCONNECT {self.negotiated_speed}/ARQ/V42BIS\r\n".encode()
+                elif self.negotiated_speed <= 33600:
+                    return f"\r\nCONNECT {self.negotiated_speed}/ARQ/V42BIS\r\n".encode()
+                elif self.negotiated_speed <= 56000:
+                    return f"\r\nCONNECT {self.negotiated_speed}/ARQ/V90\r\n".encode()
+                else:
+                    return f"\r\nCONNECT {self.negotiated_speed}/ARQ\r\n".encode()
+        else:
+            return f"\r\nCONNECT {self.connect_speed}\r\n".encode()
     
     def _handle_ato_command(self, serial_port):
         if not self.connected or not self.socket_connection:
@@ -185,7 +404,8 @@ class HayesModem:
             return
             
         logging.info("ATO command - returning to online mode")
-        connect_message = f"\r\nCONNECT {self.connect_speed}\r\n".encode()
+
+        connect_message = self._get_connect_message()
         serial_port.write(connect_message)
         serial_port.flush()
         self.in_command_mode = False
