@@ -235,7 +235,7 @@ def main():
     log_file = args.log or config.get('log_file', 'crossbridge.log')
     setup_logging(log_level, log_file)
 
-    logging.info(f"VesperNet PPP Bridge v1.5 starting")
+    logging.info(f"VesperNet PPP Bridge v1.5.1 starting")
     logging.info(f"Platform: {sys.platform}")
 
     global USER_NAME, USER_PASSWORD, DEBUG
@@ -307,7 +307,7 @@ def main():
                 return 1
 
         if emu_modem:
-            modem = HayesModem(USER_NAME, USER_PASSWORD, DEBUG, connect_speed)
+            modem = HayesModem(USER_NAME, USER_PASSWORD, DEBUG, connect_speed, baud_rate)
             modem.emulate_modem(serial_port, server_host, server_port)
         else:
             result = run_direct_bridge(serial_port, server_host, server_port, USER_NAME, USER_PASSWORD, connection_retries)
