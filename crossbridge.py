@@ -217,15 +217,15 @@ def main():
 
     serial_group = parser.add_argument_group('Serial Port')
     serial_group.add_argument("-d", "--device", help="Serial device path")
-    serial_group.add_argument("-b", "--baud", type=int, help="Baud rate")
+    serial_group.add_argument("-b", "--baud", type=int, help="Baud rate (default: 38400)")
     serial_group.add_argument("-e", "--emulate", action="store_true", help="Emulate a modem with AT commands")
 
     advanced_group = parser.add_argument_group('Advanced Options')
     advanced_group.add_argument("-c", "--config", help="Path to configuration file")
-    advanced_group.add_argument("--speed", type=int, help="Reported connection speed (default: 33600)")
+    advanced_group.add_argument("-s", "--speed", type=int, help="Reported connection speed (default: 33600)")
     advanced_group.add_argument("-t", "--timeout", type=int, help="Inactivity timeout in seconds")
     advanced_group.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging")
-    advanced_group.add_argument("--log", help="Log file path")
+    advanced_group.add_argument("-l", "--log", help="Log file path")
 
     args = parser.parse_args()
 
