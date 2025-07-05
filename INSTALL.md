@@ -91,6 +91,8 @@ pip install pyserial
    notepad %USERPROFILE%\vespernet\bridge-config.json
    ```
 
+   **Note** This configuration file can also be placed in the same folder as crossbridge.py.
+
 2. Add the following configuration, adjusting values as needed:
 
    ```json
@@ -100,8 +102,9 @@ pip install pyserial
        "server_host": "49.12.195.38",
        "server_port": 6060,
        "device": "/dev/ttyUSB0",
-       "baud_rate": 115200,
-       "emulate_modem": false,
+       "baud_rate": 38400,
+       "connect_speed": 33600,
+       "emulate_modem": true,
        "inactivity_timeout": 300,
        "connection_retries": 3,
        "debug": false,
@@ -131,7 +134,7 @@ python crossbridge.py
 
 ### With Modem Emulation
 
-This mode emulates a modem with AT commands for vintage computers that expect to dial in:
+This mode emulates a modem with AT commands for vintage hardware / emulated environments that expect to dial in:
 
 ```bash
 # Linux/macOS
@@ -151,7 +154,8 @@ The bridge supports various command-line options:
 
 ```
 -d, --device      Serial device path (e.g., /dev/ttyUSB0 or COM3)
--b, --baud        Baud rate (default: 115200)
+-b, --baud        Baud rate (default: 38400)
+-s, --speed       Modem connection speed (default: 33600)
 -e, --emulate     Enable modem emulation with AT commands
 -u, --username    Username for authentication
 -p, --password    Password for authentication
@@ -159,7 +163,7 @@ The bridge supports various command-line options:
 -v, --verbose     Enable verbose logging
 -r, --retries     Number of connection retries
 -t, --timeout     Inactivity timeout in seconds
---log             Log file path
+-l, --log         Log file path
 ```
 
 ## Windows-Specific Setup for Emulation
@@ -177,16 +181,16 @@ When using modem emulation on Windows, you'll need a null-modem emulator to crea
    "device": "COM3"
    ```
 
-4. Configure your vintage computer or emulator to use the other port (e.g., COM4)
+4. Configure your vintage hardware or emulator to use the other port (e.g., COM4)
 
 5. Run the bridge with modem emulation enabled:
    ```cmd
    python crossbridge.py -e
    ```
 
-6. Your vintage computer can now dial using standard AT commands (e.g., `ATDT`)
+6. Your vintage hardware can now dial using standard AT commands (e.g., `ATDT`)
 
-## Connecting Physical Vintage Computers
+## Connecting Physical Vintage Hardware
 
 ### Hardware Requirements
 
@@ -197,7 +201,7 @@ When using modem emulation on Windows, you'll need a null-modem emulator to crea
 ### Wiring Diagram for NULL Modem Connection
 
 ```
-PC/Bridge Side             Vintage Computer Side
+PC/Bridge Side             Vintage Hardware Side
 (DB9 Female)               (DB9 Female)
      
      RXD 2 ──────────────── 3 TXD
