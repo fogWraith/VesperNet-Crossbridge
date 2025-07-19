@@ -14,785 +14,837 @@
 #   You should have received a copy of the GNU General Public License
 #   along with this program.  If not, see <https://www.gnu.org/licenses/>.
 ###
-import socket
-import time
+import asyncio
 import logging
-import sys
+import zlib
+import random
+from typing import Optional
+from dataclasses import dataclass
 
-DEBUG = False
-IS_WINDOWS = sys.platform.startswith('win')
+from serial_utils import SerialTransport
 
-class HayesModem:
-    def __init__(self, username, password, debug=False, connect_speed=None, baud_rate=None):
+class SimpleCompression:
+    def __init__(self):
+        self.compression_enabled = False
+        self.compression_level = 1
+        self.compression_ratio = 0.0
+        self.bytes_compressed = 0
+        self.bytes_original = 0
+        self.logger = logging.getLogger(__name__)
+    
+    def enable_compression(self, level: int = 1) -> None:
+        self.compression_enabled = True
+        self.compression_level = max(1, min(9, level))
+        self.logger.info(f"Compression enabled (level {self.compression_level})")
+    
+    def disable_compression(self) -> None:
+        self.compression_enabled = False
+        self.logger.info("Compression disabled")
+    
+    async def compress_data(self, data: bytes) -> bytes:
+        if not self.compression_enabled or len(data) < 64:
+            return data
+        
+        try:
+            compressed = zlib.compress(data, level=self.compression_level)
+            
+            if len(compressed) < len(data) * 0.8:
+                self.bytes_original += len(data)
+                self.bytes_compressed += len(compressed)
+                self.compression_ratio = (1.0 - (self.bytes_compressed / self.bytes_original)) * 100
+                
+                return b'\x1b\x43' + compressed
+            else:
+                return data
+                
+        except Exception as e:
+            self.logger.error(f"Compression error: {e}")
+            return data
+    
+    async def decompress_data(self, data: bytes) -> bytes:
+        if not data or len(data) < 3:
+            return data
+        
+        try:
+            if data[:2] == b'\x1b\x43':
+                compressed_data = data[2:]
+                decompressed = zlib.decompress(compressed_data)
+                self.logger.debug(f"Decompressed {len(compressed_data)} -> {len(decompressed)} bytes")
+                return decompressed
+            else:
+                return data
+                
+        except Exception as e:
+            self.logger.error(f"Decompression error: {e}")
+            return data
+    
+    def get_compression_stats(self) -> dict:
+        return {
+            'enabled': self.compression_enabled,
+            'level': self.compression_level,
+            'ratio': self.compression_ratio,
+            'bytes_original': self.bytes_original,
+            'bytes_compressed': self.bytes_compressed
+        }
+
+@dataclass
+class ModemConfig:
+    username: str
+    password: str
+    debug: bool = False
+    connect_speed: int = 33600
+    baud_rate: int = 38400
+
+class ConnectionState:
+    def __init__(self):
+        self.connected = False
+        self.in_command_mode = True
+        self.socket_connection = None
+
+class CommandProcessor:
+    def __init__(self, username: str, password: str, connect_speed: int = 33600):
         self.username = username
         self.password = password
-        self.debug = debug
-        global DEBUG
-        DEBUG = debug
-        self.connect_speed = connect_speed or 33600
-
-        self.dte_speed = baud_rate or 38400
-        self.dce_speed = None
-        self.negotiated_speed = None
-        self.modem_type = None
-
-        self.socket_connection = None
-        self.connected = False
-        self.in_command_mode = True
-        self.command_buffer = b""
-        self.disconnecting = False
-
-        self.connection_type = "V.32bis"
-        self.compression_enabled = True
-        self.error_correction = True
+        self.connect_speed = connect_speed
+        self.logger = logging.getLogger(__name__)
         
-    def emulate_modem(self, serial_port, server_host, server_port):
+        self.echo_enabled = True
+        self.verbose_responses = True
+        self.speaker_volume = 2
+        self.speaker_control = 1
+        self.auto_answer = 0
+        self.compression_enabled = False
+        self.error_correction_enabled = False
+        self.dtr_action = 2
+        self.dcd_action = 0
+        
+        self.s_registers = {
+            0: 0,
+            1: 0,
+            2: 43,
+            3: 13,
+            4: 10,
+            5: 8,
+            6: 2,
+            7: 50,
+            8: 2,
+            9: 6,
+            10: 14,
+            11: 95,
+            12: 50,
+        }
+        
+        self.signal_strength = random.randint(85, 100)
+        self.line_quality = random.randint(92, 100)
+        self.connection_type = self._determine_connection_type(connect_speed)
+        self.last_connect_speed = connect_speed
+    
+    def _determine_connection_type(self, speed: int) -> str:
+        if speed <= 9600:
+            connection_types = ["V.32", "V.22bis", "Bell 212A"]
+            return random.choice(connection_types)
+        elif speed <= 14400:
+            connection_types = ["V.32bis", "V.17"]
+            return random.choice(connection_types)
+        elif speed <= 28800:
+            connection_types = ["V.34", "V.FC"]
+            return random.choice(connection_types)
+        elif speed <= 33600:
+            connection_types = ["V.34+", "K56flex"]
+            return random.choice(connection_types)
+        elif speed <= 56000:
+            connection_types = ["V.90", "V.92", "PSTN", "Dialup"]
+            return random.choice(connection_types)
+        elif speed <= 128000:
+            connection_types = ["ISDN", "ISDN-128", "BRI-ISDN"]
+            return random.choice(connection_types)
+        elif speed <= 256000:
+            connection_types = ["ISDN-256"]
+            return random.choice(connection_types)
+    
+    def extract_command(self, data: bytes) -> Optional[str]:
         try:
-            server_address = (server_host, server_port)
-            logging.info("Modem emulation started - waiting for AT commands")
+            command = data.decode('utf-8', errors='ignore').strip().upper()
+            if command.startswith('AT'):
+                return command
+            return None
+        except:
+            return None
+    
+    async def process_basic_command(self, command: str, serial_transport: SerialTransport) -> bool:
+        try:
+            if command == "AT":
+                await self._send_response(serial_transport, "OK")
+                return True
             
-            while True:
-                if self.in_command_mode:
-                    self._handle_command_mode(serial_port, server_address)
+            elif command == "ATI" or command == "ATI0":
+                await self._send_response(serial_transport, "VesperNet PPP Bridge v2.0.0")
+                await self._send_response(serial_transport, "OK")
+                return True
+            elif command == "ATI1":
+                await self._send_response(serial_transport, "VesperNet Bridge ROM v2.0")
+                await self._send_response(serial_transport, "OK")
+                return True
+            elif command == "ATI2":
+                await self._send_response(serial_transport, "ROM checksum: A5B2C3D4")
+                await self._send_response(serial_transport, "OK")
+                return True
+            elif command == "ATI3":
+                await self._send_response(serial_transport, f"VesperNet PPP Bridge v2.0.0 - Signal: {self.signal_strength}%")
+                await self._send_response(serial_transport, "OK")
+                return True
+            elif command == "ATI4":
+                await self._send_response(serial_transport, "VesperNet Bridge - Enhanced Hayes Compatible")
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command == "ATZ" or command == "ATZ0":
+                await self._reset_modem_settings()
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command == "ATE0":
+                self.echo_enabled = False
+                await self._send_response(serial_transport, "OK")
+                return True
+            elif command == "ATE1":
+                self.echo_enabled = True
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command == "ATV0":
+                self.verbose_responses = False
+                await self._send_response(serial_transport, "0")
+                return True
+            elif command == "ATV1":
+                self.verbose_responses = True
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command.startswith("ATM"):
+                volume = command[3:] if len(command) > 3 else "1"
+                try:
+                    self.speaker_control = int(volume)
+                    await self._send_response(serial_transport, "OK")
+                except ValueError:
+                    await self._send_response(serial_transport, "ERROR")
+                return True
+            
+            elif command.startswith("ATL"):
+                volume = command[3:] if len(command) > 3 else "2"
+                try:
+                    self.speaker_volume = int(volume)
+                    await self._send_response(serial_transport, "OK")
+                except ValueError:
+                    await self._send_response(serial_transport, "ERROR")
+                return True
+            
+            elif command.startswith("ATS"):
+                return await self._handle_s_register_command(command, serial_transport)
+            
+            elif command.startswith("ATA"):
+                await self._send_response(serial_transport, "NO CARRIER")
+                return True
+            
+            elif command.startswith("AT&D"):
+                dtr_setting = command[4:] if len(command) > 4 else "2"
+                try:
+                    self.dtr_action = int(dtr_setting)
+                    await self._send_response(serial_transport, "OK")
+                except ValueError:
+                    await self._send_response(serial_transport, "ERROR")
+                return True
+            
+            elif command.startswith("AT&C"):
+                dcd_setting = command[4:] if len(command) > 4 else "1"
+                try:
+                    self.dcd_action = int(dcd_setting)
+                    await self._send_response(serial_transport, "OK")
+                except ValueError:
+                    await self._send_response(serial_transport, "ERROR")
+                return True
+            
+            # Flow control (acknowledge but don't implement)
+            elif command.startswith("AT&K"):
+                await self._send_response(serial_transport, "OK")
+                return True
+            elif command.startswith("AT&R"):
+                await self._send_response(serial_transport, "OK")
+                return True
+            elif command.startswith("AT&S"):
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command.startswith("AT%C"):
+                compression_setting = command[4:] if len(command) > 4 else "0"
+                if compression_setting == "1":
+                    self.compression_enabled = True
+                    await self._send_response(serial_transport, "OK")
+                elif compression_setting == "0":
+                    self.compression_enabled = False
+                    await self._send_response(serial_transport, "OK")
                 else:
-                    if not self.connected:
-                        logging.info("Returning to command mode after connection ended")
-                        self.in_command_mode = True
-                        self.disconnecting = False
-                    else:
-                        logging.warning("Unexpected state: not in command mode but in main loop")
-                        self.in_command_mode = True
-                
-                time.sleep(0.01)
+                    await self._send_response(serial_transport, "ERROR")
+                return True
+            
+            elif command.startswith("AT&Q"):
+                error_correction = command[4:] if len(command) > 4 else "0"
+                if error_correction == "5":
+                    self.error_correction_enabled = True
+                    await self._send_response(serial_transport, "OK")
+                elif error_correction == "0":
+                    self.error_correction_enabled = False
+                    await self._send_response(serial_transport, "OK")
+                else:
+                    await self._send_response(serial_transport, "ERROR")
+                return True
+            
+            elif command == "AT+CSQ":
+                rssi = min(31, max(0, self.signal_strength // 3))
+                await self._send_response(serial_transport, f"+CSQ: {rssi},99")
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command == "AT+CGMI":
+                await self._send_response(serial_transport, "VesperNet")
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command == "AT+CGMM":
+                await self._send_response(serial_transport, "PPP Bridge v2.0")
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command == "AT+CGMR":
+                await self._send_response(serial_transport, "2.0.0")
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command == "AT&T":
+                await self._send_response(serial_transport, f"Line Quality: {self.line_quality}%")
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command == "AT*L":
+                await self._send_response(serial_transport, f"Last connection: {self.last_connect_speed} bps ({self.connection_type})")
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            elif command == "AT&F" or command == "AT&F0":
+                await self._reset_to_factory_defaults()
+                await self._send_response(serial_transport, "OK")
+                return True
+            
+            else:
+                await self._send_response(serial_transport, "OK")
+                return True
                 
         except Exception as e:
-            logging.error(f"Modem emulation error: {e}", exc_info=True)
-        finally:
-            self._cleanup_connection()
+            self.logger.error(f"Enhanced command processing error: {e}")
+            await self._send_response(serial_transport, "ERROR")
+            return False
     
-    def _wait_for_speed_negotiation(self, timeout=15):
+    async def _send_response(self, serial_transport: SerialTransport, response: str) -> None:
+        if self.verbose_responses:
+            formatted_response = f"\r\n{response}\r\n"
+        else:
+            if response == "OK":
+                formatted_response = "0\r"
+            elif response == "ERROR":
+                formatted_response = "4\r"
+            elif response == "NO CARRIER":
+                formatted_response = "3\r"
+            elif response == "BUSY":
+                formatted_response = "7\r"
+            elif response == "NO DIALTONE":
+                formatted_response = "6\r"
+            else:
+                formatted_response = f"\r\n{response}\r\n"
+        
+        await serial_transport.write(formatted_response.encode())
+    
+    async def _handle_s_register_command(self, command: str, serial_transport: SerialTransport) -> bool:
         try:
-            self.socket_connection.settimeout(0.5)
-            buffer = b""
-            start_time = time.time()
+            if '=' in command:
+                parts = command[3:].split('=')
+                if len(parts) == 2:
+                    register_num = int(parts[0])
+                    value = int(parts[1])
+                    if 0 <= register_num <= 255:
+                        self.s_registers[register_num] = value
+                        await self._send_response(serial_transport, "OK")
+                    else:
+                        await self._send_response(serial_transport, "ERROR")
+                else:
+                    await self._send_response(serial_transport, "ERROR")
+            elif '?' in command:
+                register_num = int(command[3:-1])
+                if register_num in self.s_registers:
+                    value = self.s_registers[register_num]
+                    await self._send_response(serial_transport, f"{value:03d}")
+                    await self._send_response(serial_transport, "OK")
+                else:
+                    await self._send_response(serial_transport, "ERROR")
+            else:
+                await self._send_response(serial_transport, "OK")
+            return True
+        except (ValueError, IndexError):
+            await self._send_response(serial_transport, "ERROR")
+            return False
+    
+    async def _reset_modem_settings(self) -> None:
+        self.echo_enabled = True
+        self.verbose_responses = True
+        self.speaker_volume = 2
+        self.speaker_control = 1
+        self.auto_answer = 0
+        self.dtr_action = 2
+        self.dcd_action = 0
+        self.s_registers.update({
+            0: 0,
+            7: 50,
+            12: 50,
+        })
+        self.logger.debug("Modem settings reset to defaults")
+    
+    async def _reset_to_factory_defaults(self) -> None:
+        await self._reset_modem_settings()
+        self.compression_enabled = False
+        self.error_correction_enabled = False
+        self.logger.info("Modem reset to factory defaults")
+
+class ModemEmulator:
+    def __init__(self, modem_config: ModemConfig, is_windows: bool = False):
+        self.modem_config = modem_config
+        self.is_windows = is_windows
+        self.connection_state = ConnectionState()
+        self.logger = logging.getLogger(__name__)
+        
+        self.compression = SimpleCompression()
+        
+        self.command_processor = CommandProcessor(
+            username=self.modem_config.username,
+            password=self.modem_config.password,
+            connect_speed=self.modem_config.connect_speed
+        )
+        
+        connection_type = self.command_processor._determine_connection_type(self.modem_config.connect_speed)
+        self.connection_quality = {
+            'signal_strength': random.randint(85, 100),
+            'line_quality': random.randint(90, 100),
+            'error_rate': random.uniform(0.0001, 0.002),
+            'throughput': self.modem_config.connect_speed,
+            'connection_type': connection_type
+        }
+    
+    def update_connection_quality(self, **kwargs) -> None:
+        self.connection_quality.update(kwargs)
+        self.command_processor.signal_strength = self.connection_quality['signal_strength']
+        self.command_processor.line_quality = self.connection_quality['line_quality']
+        self.command_processor.connection_type = self.connection_quality['connection_type']
+    
+    def get_connection_stats(self) -> dict:
+        stats = {
+            'connection_quality': self.connection_quality.copy(),
+            'compression': self.compression.get_compression_stats(),
+            'modem_settings': {
+                'echo_enabled': self.command_processor.echo_enabled,
+                'verbose_responses': self.command_processor.verbose_responses,
+                'compression_enabled': self.command_processor.compression_enabled,
+                'error_correction_enabled': self.command_processor.error_correction_enabled,
+            }
+        }
+        return stats
+    
+    async def emulate_modem(self, serial_transport: SerialTransport, server_host: str, server_port: int) -> None:
+        try:
+            self.logger.info("Starting modem emulation")
+
+            command_task = asyncio.create_task(
+                self._command_processing_loop(serial_transport, server_host, server_port)
+            )
             
-            logging.info("Waiting for speed negotiation from VesperNet ...")
+            await asyncio.gather(command_task)
             
-            while time.time() - start_time < timeout:
-                try:
-                    data = self.socket_connection.recv(1024)
+        except Exception as e:
+            self.logger.error(f"Modem emulation failed: {e}")
+            raise
+    
+    async def _command_processing_loop(self, serial_transport: SerialTransport, server_host: str, server_port: int) -> None:
+        command_buffer = b""
+        
+        try:
+            while await serial_transport.is_connected():
+                if self.connection_state.in_command_mode:
+                    data = await serial_transport.read()
                     if not data:
-                        break
-                        
-                    buffer += data
+                        await asyncio.sleep(0.001)
+                        continue
                     
-                    if b"\n" in buffer:
-                        lines = buffer.split(b"\n")
-                        for line in lines[:-1]:
-                            line_str = line.decode('ascii', errors='ignore')
-                            
-                            if line_str.startswith("NEGOTIATE:"):
-                                try:
-                                    parts = line_str.split(":")
-                                    if len(parts) >= 3:
-                                        self.negotiated_speed = int(parts[1])
-                                        self.modem_type = parts[2]
+                    command_buffer += data
+                    
+                    while b'\r' in command_buffer or b'\n' in command_buffer:
+                        if b'\r' in command_buffer:
+                            cmd_bytes, command_buffer = command_buffer.split(b'\r', 1)
+                        else:
+                            cmd_bytes, command_buffer = command_buffer.split(b'\n', 1)
+                        
+                        command = self.command_processor.extract_command(cmd_bytes)
+                        if command:
+                            await self._process_command(command, serial_transport, server_host, server_port)
+                
+                elif self.connection_state.connected:
+                    await self._bridge_ppp_data(serial_transport)
+                
+                await asyncio.sleep(0.001)
+                
+        except Exception as e:
+            self.logger.error(f"Command processing loop error: {e}")
+    
+    async def _process_command(self, command: str, serial_transport: SerialTransport, server_host: str, server_port: int) -> None:
+        try:
+            if command.startswith("ATDT") or command.startswith("ATD"):
+                await self._handle_dial_command(command, serial_transport, server_host, server_port)
+                return
+            
+            if command.startswith("ATH"):
+                await self._handle_hangup_command(serial_transport)
+                return
+            
+            await self.command_processor.process_basic_command(command, serial_transport)
+            
+        except Exception as e:
+            self.logger.error(f"Command processing error: {e}")
+    
+    async def _handle_hangup_command(self, serial_transport: SerialTransport) -> None:
+        try:
+            self.logger.info("Hangup command received")
+            
+            if hasattr(self.connection_state, 'socket_connection') and self.connection_state.socket_connection:
+                await self.connection_state.socket_connection.close()
+                self.connection_state.socket_connection = None
+            
+            self.connection_state.connected = False
+            self.connection_state.in_command_mode = True
+            
+            await serial_transport.write(b"\r\nOK\r\n")
+            
+        except Exception as e:
+            self.logger.error(f"Hangup command error: {e}")
+            await serial_transport.write(b"\r\nERROR\r\n")
+    
+    async def _handle_dial_command(self, command: str, serial_transport: SerialTransport, server_host: str, server_port: int) -> None:
+        try:
+            from crossbridge import SocketTransport, BridgeConfig, PPPBridgeConfig
+            
+            if command.startswith("ATDT"):
+                phone_number = command[4:].strip() if len(command) > 4 else ""
+            elif command.startswith("ATD"):
+                phone_number = command[3:].strip() if len(command) > 3 else ""
+            else:
+                phone_number = ""
+                
+            self.logger.info(f"Dial command: {phone_number}")
+            
+            bridge_config = PPPBridgeConfig(
+                username=self.modem_config.username,
+                password=self.modem_config.password,
+                server_host=server_host,
+                server_port=server_port,
+                device="",
+                baud_rate=self.modem_config.baud_rate,
+                connect_speed=self.modem_config.connect_speed,
+                is_windows=self.is_windows
+            )
+            
+            config = BridgeConfig(bridge_config=bridge_config)
+            
+            socket_transport = SocketTransport(config)
+            
+            try:
+                await socket_transport.connect(server_host, server_port)
+                
+                if not await self._authenticate(socket_transport):
+                    await socket_transport.close()
+                    await serial_transport.write(b"\r\nNO CARRIER\r\n")
+                    return
+
+                await self._send_connection_sequence(serial_transport)
+                
+                if not await self._speed_negotiation(socket_transport):
+                    await socket_transport.close()
+                    await serial_transport.write(b"\r\nNO CARRIER\r\n")
+                    return
+                
+                self.connection_state.connected = True
+                self.connection_state.in_command_mode = False
+                self.connection_state.socket_connection = socket_transport
+                
+                self.logger.info("Connection established, switching to data mode")
+                
+            except Exception as e:
+                self.logger.error(f"Dial command failed: {e}")
+                await serial_transport.write(b"\r\nNO CARRIER\r\n")
+                await socket_transport.close()
+                
+        except Exception as e:
+            self.logger.error(f"Dial command error: {e}")
+
+    async def _authenticate(self, socket_transport) -> bool:
+        try:
+            auth_string = f"{self.modem_config.username}:{self.modem_config.password}\r\n".encode()
+            self.logger.debug(f"Sending authentication: {auth_string}")
+            await socket_transport.write(auth_string)
+            
+            await asyncio.sleep(0.5)
+            
+            try:
+                response = await asyncio.wait_for(
+                    socket_transport.read(1024),
+                    timeout=2.0
+                )
+                
+                self.logger.debug(f"Authentication response: {response}")
+                
+                if b"Authentication failed" in response:
+                    self.logger.error("Authentication failed")
+                    return False
+                    
+                self.logger.info("Authentication successful")
+                return True
+                    
+            except asyncio.TimeoutError:
+                self.logger.debug("Authentication timeout, assuming success")
+                return True
+            
+        except Exception as e:
+            self.logger.error(f"Authentication failed: {e}")
+            return False
+    
+    async def _send_connection_sequence(self, serial_transport: SerialTransport) -> None:
+        try:
+            if not self.is_windows:
+                await serial_transport.write(b"\r\nDialing...\r\n")
+                await asyncio.sleep(0.1)
+                
+                await serial_transport.write(b"\r\nRinging...\r\n")
+                await asyncio.sleep(0.1)
+                
+                signal_msg = f"\r\nSignal Quality: {self.connection_quality['signal_strength']}%\r\n"
+                await serial_transport.write(signal_msg.encode())
+                await asyncio.sleep(0.1)
+                
+                await serial_transport.write(b"\r\nCarrier detected\r\n")
+                await asyncio.sleep(0.1)
+                
+                line_msg = f"\r\nLine Quality: {self.connection_quality['line_quality']}%\r\n"
+                await serial_transport.write(line_msg.encode())
+                await asyncio.sleep(0.1)
+                
+                type_msg = f"\r\nConnection Type: {self.connection_quality['connection_type']}\r\n"
+                await serial_transport.write(type_msg.encode())
+                await asyncio.sleep(0.1)
+
+            if self.command_processor.compression_enabled:
+                compression_status = " COMPRESSION"
+            else:
+                compression_status = ""
+            
+            if self.command_processor.error_correction_enabled:
+                error_correction_status = " ERROR_CORRECTION"
+            else:
+                error_correction_status = ""
+            
+            connect_msg = f"\r\nCONNECT {self.modem_config.connect_speed}{compression_status}{error_correction_status}\r\n"
+            await serial_transport.write(connect_msg.encode())
+            
+            self.command_processor.last_connect_speed = self.modem_config.connect_speed
+            self.command_processor.connection_type = self.connection_quality['connection_type']
+            
+            self.logger.info(f"Enhanced connection sequence sent - Speed: {self.modem_config.connect_speed}, Quality: {self.connection_quality['signal_strength']}%, Type: {self.connection_quality['connection_type']}")
+            
+        except Exception as e:
+            self.logger.error(f"Connection sequence error: {e}")
+    
+    async def _speed_negotiation(self, socket_transport) -> bool:
+        try:
+            self.logger.info("Waiting for speed negotiation ...")
+            
+            start_time = asyncio.get_event_loop().time()
+            timeout = 10.0
+            
+            while (asyncio.get_event_loop().time() - start_time) < timeout:
+                try:
+                    data = await asyncio.wait_for(
+                        socket_transport.read(1024),
+                        timeout=1.0
+                    )
+                    
+                    if data:
+                        response = data.decode('utf-8', errors='ignore')
+                        self.logger.debug(f"Speed negotiation data: {response}")
+                        
+                        if "NEGOTIATE:" in response:
+                            lines = response.split('\n')
+                            for line in lines:
+                                if "NEGOTIATE:" in line:
+                                    parts = line.strip().split(":")
+                                    if len(parts) >= 2:
+                                        speed = parts[1].strip()
+                                        connection_type = parts[2].strip() if len(parts) > 2 else "Unknown"
                                         
-                                        logging.info(f"Received speed negotiation: {self.negotiated_speed} bps ({self.modem_type})")
+                                        self.logger.info(f"Received speed negotiation: {speed} bps ({connection_type})")
+                                        self.logger.info(f"Speed negotiation successful: {speed} bps ({connection_type})")
+                                        
+                                        self.logger.info(f"Dial successful - DTE: {self.modem_config.baud_rate}, DCE: {speed}, Negotiated: {speed} ({connection_type})")
+                                        
                                         return True
-                                except (ValueError, IndexError) as e:
-                                    logging.debug(f"Failed to parse negotiation: {e}")
-                                    
-                            elif line_str.startswith("ERROR:"):
-                                logging.error(f"PPP daemon reported error: {line_str}")
-                                return False
-                        
-                        buffer = lines[-1]
-                        
-                except socket.timeout:
+                
+                except asyncio.TimeoutError:
                     continue
                 except Exception as e:
-                    logging.debug(f"Error reading negotiation: {e}")
-                    break
-                    
+                    self.logger.debug(f"Speed negotiation read error: {e}")
+                    continue
+            
+            self.logger.error("Speed negotiation timeout")
+            return False
+            
         except Exception as e:
-            logging.debug(f"Error in speed negotiation: {e}")
-            
-        logging.warning("No speed negotiation received from PPP daemon")
-        return False
-    
-    def _handle_command_mode(self, serial_port, server_address):
-        if serial_port.in_waiting > 0:
-            data = serial_port.read(serial_port.in_waiting)
-            self.command_buffer += data
+            self.logger.error(f"Speed negotiation failed: {e}")
+            return False
 
-            if self.connected and self.socket_connection and not self.disconnecting:
-                if self._is_ppp_data(data):
-                    logging.info("PPP data detected - entering data mode immediately")
-                    self.socket_connection.sendall(data)
-                    self.in_command_mode = False
-                    
-                    bridge_result = self._bridge_ppp_connection(serial_port)
-                    
-                    if bridge_result == "COMMAND_MODE":
-                        logging.info("Returned to command mode via escape sequence")
-                        self.in_command_mode = True
-                    else:
-                        self._handle_connection_ended(serial_port, bridge_result)
-                    return
-
-            if b"\r" in self.command_buffer:
-                command_parts = self.command_buffer.split(b"\r")
-                for cmd_bytes in command_parts[:-1]:
-                    cmd = self._extract_at_command(cmd_bytes)
-                    if not cmd:
-                        continue
-                        
-                    logging.info(f"Processing command: {cmd}")
-                    self._process_at_command(cmd, serial_port, server_address)
-
-                self.command_buffer = command_parts[-1]
-
-    def _handle_connection_ended(self, serial_port, reason):
-        self.disconnecting = True
-        
-        if reason == "SERVER_CLOSED":
-            logging.info("Server terminated connection - sending NO CARRIER")
-            try:
-                serial_port.write(b"\r\nNO CARRIER\r\n")
-                serial_port.flush()
-            except Exception as e:
-                logging.debug(f"Error sending NO CARRIER: {e}")
-        elif reason == "LCP_TERMINATE":
-            logging.info("LCP termination - connection ended gracefully")
-        
-        self._cleanup_connection()
-        self.in_command_mode = True
-        self.disconnecting = False
-        logging.info("Connection ended - ready for new commands")
-    
-    def _process_at_command(self, cmd, serial_port, server_address):
-        if cmd in ["ATI", "ATI0"]:
-            serial_port.write(b"\r\nVesperNet Hayes Compatible Modem v2.0\r\n")
-            serial_port.flush()
-            return
-            
-        elif cmd == "ATI1":
-            if self.connected and self.negotiated_speed:
-                status = f"\r\nConnected at {self.negotiated_speed} bps ({self.modem_type})\r\n".encode()
-                status += f"DTE Speed: {self.dte_speed} bps\r\n".encode()
-                status += f"DCE Speed: {self.dce_speed} bps\r\n".encode()
-            else:
-                status = b"\r\nNot connected\r\n"
-            serial_port.write(status)
-            serial_port.flush()
-            return
-            
-        elif cmd == "ATI4":
-            if self.negotiated_speed:
-                settings = f"\r\nLine Speed: {self.negotiated_speed} bps\r\n".encode()
-                settings += f"Protocol: {self.modem_type}\r\n".encode()
-            else:
-                settings = b"\r\nNo active connection\r\n"
-            serial_port.write(settings)
-            serial_port.flush()
-            return
-            
-        elif cmd.startswith("AT*N"):
-            if self.negotiated_speed:
-                negotiation = f"\r\n*N: {self.negotiated_speed} bps via {self.modem_type}\r\n".encode()
-            else:
-                negotiation = b"\r\n*N: No negotiation\r\n"
-            serial_port.write(negotiation)
-            serial_port.flush()
-            return
-        
-        if cmd.startswith("ATD"):
-            self._handle_dial_command(cmd, serial_port, server_address)
-            
-        elif cmd == "ATO" and self.connected and self.socket_connection:
-            self._handle_ato_command(serial_port)
-            
-        elif cmd in ["ATH", "ATH0"]:
-            self._handle_hangup_command(serial_port)
-            
-        elif self._is_modem_init_command(cmd):
-            self._handle_modem_init_command(cmd, serial_port)
-            
-        else:
-            self._handle_generic_at_command(cmd, serial_port)
-    
-    def _handle_dial_command(self, cmd, serial_port, server_address):
-        logging.info(f"Dial command: {cmd}")
-        
-        self._cleanup_connection()
-        
+    async def _bridge_ppp_data(self, serial_transport: SerialTransport) -> None:
         try:
-            self.socket_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket_connection.settimeout(30)
-            self.socket_connection.connect(server_address)
-
-            auth_string = f"{self.username}:{self.password}\r\n".encode()
-            self.socket_connection.sendall(auth_string)
-            logging.info(f"Sent authentication for user: {self.username}")
-
-            time.sleep(1)
-
-            self.socket_connection.settimeout(2)
-            try:
-                response = self.socket_connection.recv(1024)
-                if b"Authentication failed" in response:
-                    logging.error("Authentication failed")
-                    serial_port.write(b"\r\nNO CARRIER\r\n")
-                    serial_port.flush()
-                    self._cleanup_connection()
-                    return
-            except socket.timeout:
-                pass
-
-            if self._wait_for_speed_negotiation():
-                logging.info(f"Speed negotiation successful: {self.negotiated_speed} bps ({self.modem_type})")
-            else:
-                logging.warning("Speed negotiation failed, using fallback")
-                self.negotiated_speed = self.connect_speed
-                self.modem_type = "V.34+"
-
-            self._emulate_modem_handshake(serial_port)
+            if not self.connection_state.socket_connection:
+                self.logger.warning("No socket connection available for PPP bridging")
+                self.connection_state.connected = False
+                self.connection_state.in_command_mode = True
+                return
             
-            connect_message = self._get_connect_message()
-            serial_port.write(connect_message)
-            serial_port.flush()
-
-            self.connected = True
-            self.in_command_mode = False
-            self.disconnecting = False
+            socket_transport = self.connection_state.socket_connection
+            self.logger.info("Starting PPP data bridging")
             
-            logging.info(f"Dial successful - DTE: {self.dte_speed}, DCE: {self.dce_speed}, Negotiated: {self.negotiated_speed} ({self.modem_type})")
+            if not await socket_transport.is_connected():
+                self.logger.error("Socket connection lost before PPP bridging")
+                self.connection_state.connected = False
+                self.connection_state.in_command_mode = True
+                return
             
-            bridge_result = self._bridge_ppp_connection(serial_port)
-            self._handle_connection_ended(serial_port, bridge_result)
-
-        except Exception as e:
-            logging.error(f"Dial failed: {e}")
-            serial_port.write(b"\r\nNO CARRIER\r\n")
-            serial_port.flush()
-            self._cleanup_connection()
-    
-    def _emulate_modem_handshake(self, serial_port):
-        try:
-            if self.modem_type and "ISDN" in self.modem_type:
-                serial_port.write(b"\r\nDialing ISDN number...\r\n")
-                serial_port.flush()
-                time.sleep(0.8)
-                
-                serial_port.write(b"\r\nISDN call setup...\r\n")
-                serial_port.flush()
-                time.sleep(1.0)
-                
-                serial_port.write(b"\r\nB-channel connected\r\n")
-                serial_port.flush()
-                time.sleep(0.5)
-            else:
-                serial_port.write(b"\r\nDialing...\r\n")
-                serial_port.flush()
-                time.sleep(1.0)
-                
-                serial_port.write(b"\r\nRinging...\r\n")
-                serial_port.flush()
-                time.sleep(1.5)
-                
-                serial_port.write(b"\r\nCarrier detected\r\n")
-                serial_port.flush()
-                time.sleep(0.8)
-
-            if self.negotiated_speed and self.modem_type:
-                if "ISDN" in self.modem_type:
-                    if "64" in self.modem_type:
-                        serial_port.write(b"\r\nProtocol: ISDN 64k (1B)\r\n")
-                    elif "112" in self.modem_type:
-                        serial_port.write(b"\r\nProtocol: ISDN 112k (2B)\r\n")
-                    elif "128" in self.modem_type:
-                        serial_port.write(b"\r\nProtocol: ISDN 128k (2B+D)\r\n")
-                    elif "192" in self.modem_type:
-                        serial_port.write(b"\r\nProtocol: ISDN 192k (3B)\r\n")
-                    elif "256" in self.modem_type:
-                        serial_port.write(b"\r\nProtocol: ISDN 256k (4B)\r\n")
-                    else:
-                        serial_port.write(f"\r\nProtocol: {self.modem_type}\r\n".encode())
-                    
-                    serial_port.flush()
-                    time.sleep(0.5)
-                    
-                    serial_port.write(b"\r\nCompression: STAC/LZS\r\n")
-                    serial_port.flush()
-                    time.sleep(0.3)
-                    
-                    serial_port.write(b"\r\nError Correction: LAPD\r\n")
-                    serial_port.flush()
-                    time.sleep(0.3)
-                else:
-                    if self.modem_type == "V.32bis":
-                        serial_port.write(b"\r\nProtocol: V.32bis\r\n")
-                    elif self.modem_type == "V.34":
-                        serial_port.write(b"\r\nProtocol: V.34\r\n")
-                    elif self.modem_type == "V.34+":
-                        serial_port.write(b"\r\nProtocol: V.34+\r\n")
-                    elif self.modem_type == "V.90":
-                        serial_port.write(b"\r\nProtocol: V.90\r\n")
-                    else:
-                        serial_port.write(f"\r\nProtocol: {self.modem_type}\r\n".encode())
-                    
-                    serial_port.flush()
-                    time.sleep(0.5)
-                    
-                    if self.negotiated_speed >= 9600:
-                        serial_port.write(b"\r\nCompression: V.42bis\r\n")
-                        serial_port.flush()
-                        time.sleep(0.3)
-                        
-                    if self.negotiated_speed >= 2400:
-                        serial_port.write(b"\r\nError Correction: LAP-M\r\n")
-                        serial_port.flush()
-                        time.sleep(0.3)
-                
-                self.dce_speed = self.negotiated_speed
-                
-            else:
-                serial_port.write(b"\r\nProtocol: Unknown\r\n")
-                serial_port.flush()
-                self.dce_speed = self.connect_speed
-                
-        except Exception as e:
-            logging.debug(f"Error in handshake emulation: {e}")
-    
-    def _get_connect_message(self):
-        if self.negotiated_speed and self.modem_type:
-            if "ISDN" in self.modem_type:
-                if "64" in self.modem_type:
-                    return b"\r\nCONNECT ISDN 64000\r\n"
-                elif "112" in self.modem_type:
-                    return b"\r\nCONNECT ISDN 112000/2B\r\n"
-                elif "128" in self.modem_type:
-                    return b"\r\nCONNECT ISDN 128000/2B+D\r\n"
-                elif "192" in self.modem_type:
-                    return b"\r\nCONNECT ISDN 192000/3B\r\n"
-                elif "256" in self.modem_type:
-                    return b"\r\nCONNECT ISDN 256000/4B\r\n"
-                else:
-                    return f"\r\nCONNECT ISDN {self.negotiated_speed}\r\n".encode()
-            else:
-                if self.negotiated_speed <= 2400:
-                    return f"\r\nCONNECT {self.negotiated_speed}\r\n".encode()
-                elif self.negotiated_speed <= 9600:
-                    return f"\r\nCONNECT {self.negotiated_speed}/ARQ\r\n".encode()
-                elif self.negotiated_speed <= 14400:
-                    return f"\r\nCONNECT {self.negotiated_speed}/ARQ/V42BIS\r\n".encode()
-                elif self.negotiated_speed <= 33600:
-                    return f"\r\nCONNECT {self.negotiated_speed}/ARQ/V42BIS\r\n".encode()
-                elif self.negotiated_speed <= 56000:
-                    return f"\r\nCONNECT {self.negotiated_speed}/ARQ/V90\r\n".encode()
-                else:
-                    return f"\r\nCONNECT {self.negotiated_speed}/ARQ\r\n".encode()
-        else:
-            return f"\r\nCONNECT {self.connect_speed}\r\n".encode()
-    
-    def _handle_ato_command(self, serial_port):
-        if not self.connected or not self.socket_connection:
-            logging.warning("ATO command but no active connection")
-            serial_port.write(b"\r\nNO CARRIER\r\n")
-            serial_port.flush()
-            return
+            serial_to_socket_task = asyncio.create_task(
+                self._bridge_serial_to_socket(serial_transport, socket_transport)
+            )
             
-        logging.info("ATO command - returning to online mode")
-
-        connect_message = self._get_connect_message()
-        serial_port.write(connect_message)
-        serial_port.flush()
-        self.in_command_mode = False
-        self.disconnecting = False
-        
-        bridge_result = self._bridge_ppp_connection(serial_port)
-        self._handle_connection_ended(serial_port, bridge_result)
-    
-    def _handle_hangup_command(self, serial_port):
-        logging.info("Hangup command received")
-        
-        if self.connected:
-            logging.info("Terminating active connection")
-            self._cleanup_connection()
-        
-        serial_port.write(b"\r\nOK\r\n")
-        serial_port.flush()
-        
-        self.connected = False
-        self.in_command_mode = True
-        self.disconnecting = False
-    
-    def _handle_modem_init_command(self, cmd, serial_port):
-        logging.debug(f"Modem init command: {cmd}")
-        serial_port.write(b"\r\nOK\r\n")
-        serial_port.flush()
-    
-    def _handle_generic_at_command(self, cmd, serial_port):
-        logging.debug(f"Generic AT command: {cmd}")
-        serial_port.write(b"\r\nOK\r\n")
-        serial_port.flush()
-    
-    def _is_ppp_data(self, data):
-        return (b'~}' in data or 
-                b'\x7e' in data or 
-                b'\xff\x03' in data)
-    
-    def _extract_at_command(self, cmd_bytes):
-        cmd = cmd_bytes.strip().decode("ascii", errors="ignore").upper()
-        if not cmd:
-            return None
-        
-        if "AT" in cmd and not cmd.startswith("AT"):
-            at_index = cmd.find("AT")
-            if at_index >= 0:
-                cmd = cmd[at_index:]
-                logging.debug(f"Extracted AT command from noise: {cmd}")
-        
-        return cmd if cmd.startswith("AT") else None
-    
-    def _is_modem_init_command(self, cmd):
-        return cmd in ["ATZ", "ATM1L1", "ATX3", "ATE1", "ATE0", "ATQ0", "ATV1"] or cmd.startswith("ATE")
-    
-    def _cleanup_connection(self):
-        if self.socket_connection:
-            try:
-                self.socket_connection.close()
-            except Exception as e:
-                logging.debug(f"Error closing socket: {e}")
-            finally:
-                self.socket_connection = None
-        
-        self.connected = False
-
-    def _bridge_ppp_connection(self, serial_port):
-        try:
-            platform_name = "Windows" if IS_WINDOWS else "Unix"
-            logging.info(f"Starting PPP data bridging ({platform_name} mode)")
+            socket_to_serial_task = asyncio.create_task(
+                self._bridge_socket_to_serial(socket_transport, serial_transport)
+            )
             
-            self.socket_connection.settimeout(0.1)
-            serial_port.timeout = 0.1
+            self.logger.debug("PPP bridging tasks created")
             
-            escape_buffer = b""
-            last_activity = time.time()
-            idle_count = 0
-            consecutive_errors = 0
-            max_consecutive_errors = 5
+            done, pending = await asyncio.wait(
+                [serial_to_socket_task, socket_to_serial_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
             
-            import crossbridge
+            self.logger.info("PPP bridging task completed")
             
-            while crossbridge.running and self.connected:
-                data_handled = False
-                current_time = time.time()
-
+            for task in done:
                 try:
-                    if serial_port.in_waiting > 0:
-                        if hasattr(serial_port, 'sock'):
-                            data = serial_port.read(4096)
-                        else:
-                            data = serial_port.read(serial_port.in_waiting)
-
-                        if data:
-                            data_handled = True
-                            last_activity = current_time
-                            consecutive_errors = 0
-                            
-                            if DEBUG:
-                                logging.debug(f"Serial->Server: {len(data)} bytes: {data.hex()}")
-
-                            escape_buffer += data
-                            if len(escape_buffer) > 20:
-                                escape_buffer = escape_buffer[-20:]
-
-                            if b"+++" in escape_buffer[-10:]:
-                                plus_index = escape_buffer.rfind(b"+++")
-                                if plus_index >= 0:
-                                    remaining = escape_buffer[plus_index + 3:]
-                                    if len(remaining) == 0:
-                                        time.sleep(1)
-                                        if serial_port.in_waiting == 0:
-                                            logging.info("Hayes escape sequence detected")
-                                            serial_port.write(b"\r\nOK\r\n")
-                                            serial_port.flush()
-                                            return "COMMAND_MODE"
-                            
-                            if DEBUG:
-                                _debug_ppp_protocols(data, "Client")
-                            
-                            try:
-                                self.socket_connection.sendall(data)
-                            except socket.error as e:
-                                logging.error(f"Failed to send data to server: {e}")
-                                return "SERVER_ERROR"
-                            
-                            time.sleep(0.001)
-                            
+                    result = await task
+                    self.logger.debug(f"Bridging task result: {result}")
                 except Exception as e:
-                    consecutive_errors += 1
-                    logging.error(f"Error reading from serial port ({consecutive_errors}): {e}")
-                    if consecutive_errors >= max_consecutive_errors:
-                        return "SERIAL_ERROR"
-
+                    self.logger.error(f"Bridging task failed: {e}")
+            
+            for task in pending:
+                task.cancel()
                 try:
-                    data = self.socket_connection.recv(4096)
-                    if data:
-                        data_handled = True
-                        last_activity = current_time
-                        consecutive_errors = 0
-
-                        if DEBUG:
-                            logging.debug(f"Server->Serial: {len(data)} bytes: {data.hex()}")
-                        
-                        if (b"\xff\x03\xc0\x21\x05" in data or
-                            b"\xff\x03\xc0\x21\x06" in data):
-                            logging.info("LCP termination detected")
-                            try:
-                                serial_port.write(data)
-                                serial_port.flush()
-                                time.sleep(0.5)
-                                serial_port.write(b"\r\nNO CARRIER\r\n")
-                                serial_port.flush()
-                            except Exception as e:
-                                logging.debug(f"Error sending LCP termination response: {e}")
-                            return "LCP_TERMINATE"
-                        
-                        if DEBUG:
-                            _debug_ppp_protocols(data, "Server")
-                        
-                        try:
-                            serial_port.write(data)
-                            serial_port.flush()
-                        except Exception as e:
-                            logging.error(f"Failed to write to serial port: {e}")
-                            return "SERIAL_ERROR"
-                        
-                        time.sleep(0.001)
-                        
-                    elif data == b'':
-                        logging.info("Server closed connection")
-                        try:
-                            serial_port.write(b"\r\nNO CARRIER\r\n")
-                            serial_port.flush()
-                        except Exception as e:
-                            logging.debug(f"Error sending NO CARRIER: {e}")
-                        return "SERVER_CLOSED"
-                        
-                except socket.timeout:
+                    await task
+                except asyncio.CancelledError:
                     pass
-                except ConnectionError as e:
-                    logging.error(f"Server connection lost: {e}")
-                    try:
-                        serial_port.write(b"\r\nNO CARRIER\r\n")
-                        serial_port.flush()
-                    except Exception as e:
-                        logging.debug(f"Error sending NO CARRIER: {e}")
-                    return "SERVER_CLOSED"
-                except Exception as e:
-                    consecutive_errors += 1
-                    logging.error(f"Error reading from server ({consecutive_errors}): {e}")
-                    if consecutive_errors >= max_consecutive_errors:
-                        return "SERVER_ERROR"
-                
-                if current_time - last_activity > 300:
-                    logging.info("Connection timeout due to inactivity")
-                    try:
-                        serial_port.write(b"\r\nNO CARRIER\r\n")
-                        serial_port.flush()
-                    except Exception as e:
-                        logging.debug(f"Error sending NO CARRIER: {e}")
-                    return "TIMEOUT"
-
-                if not data_handled:
-                    idle_count += 1
-                    if idle_count < 10:
-                        time.sleep(0.01)
-                    elif idle_count < 50:
-                        time.sleep(0.02)
-                    else:
-                        time.sleep(0.05)
-                else:
-                    idle_count = 0
-                    time.sleep(0.002)
-
-        except Exception as e:
-            logging.error(f"Bridge error: {e}")
-            try:
-                serial_port.write(b"\r\nNO CARRIER\r\n")
-                serial_port.flush()
-            except:
-                pass
-            return "BRIDGE_ERROR"
-        finally:
-            logging.info(f"PPP bridge session ended ({platform_name})")
-
-        return "DISCONNECT"
-
-def legacy_ppp_connection(serial_port, socket_connection):
-    try:
-        platform_name = "Windows" if IS_WINDOWS else "Unix"
-        logging.info(f"Starting PPP data bridging ({platform_name} mode)")
-        
-        socket_connection.settimeout(0.1)
-        serial_port.timeout = 0.1
-        
-        escape_buffer = b""
-        last_activity = time.time()
-        idle_count = 0
-        consecutive_errors = 0
-        max_consecutive_errors = 5
-        
-        import crossbridge
-        
-        while crossbridge.running:
-            data_handled = False
-            current_time = time.time()
-
-            try:
-                if serial_port.in_waiting > 0:
-                    if hasattr(serial_port, 'sock'):
-                        data = serial_port.read(4096)
-                    else:
-                        data = serial_port.read(serial_port.in_waiting)
-
-                    if data:
-                        data_handled = True
-                        last_activity = current_time
-                        consecutive_errors = 0
-                        
-                        if DEBUG:
-                            logging.debug(f"Serial->Server: {len(data)} bytes: {data.hex()}")
-
-                        escape_buffer += data
-                        if len(escape_buffer) > 20:
-                            escape_buffer = escape_buffer[-20:]
-
-                        if b"+++" in escape_buffer[-10:]:
-                            plus_index = escape_buffer.rfind(b"+++")
-                            if plus_index >= 0:
-                                remaining = escape_buffer[plus_index + 3:]
-                                if len(remaining) == 0:
-                                    time.sleep(1)
-                                    if serial_port.in_waiting == 0:
-                                        logging.info("Hayes escape sequence detected")
-                                        serial_port.write(b"\r\nOK\r\n")
-                                        serial_port.flush()
-                                        return "COMMAND_MODE"
-                        
-                        if DEBUG:
-                            _debug_ppp_protocols(data, "Client")
-                        
-                        try:
-                            socket_connection.sendall(data)
-                        except socket.error as e:
-                            logging.error(f"Failed to send data to server: {e}")
-                            break
-                        
-                        time.sleep(0.001)
-                        
-            except Exception as e:
-                consecutive_errors += 1
-                logging.error(f"Error reading from serial port ({consecutive_errors}): {e}")
-                if consecutive_errors >= max_consecutive_errors:
-                    break
             
-            try:
-                data = socket_connection.recv(4096)
-                if data:
-                    data_handled = True
-                    last_activity = current_time
-                    consecutive_errors = 0
-
-                    if DEBUG:
-                        logging.debug(f"Server->Serial: {len(data)} bytes: {data.hex()}")
-                    
-                    if (b"\xff\x03\xc0\x21\x05" in data or
-                        b"\xff\x03\xc0\x21\x06" in data):
-                        logging.info("LCP termination detected")
-                        serial_port.write(data)
-                        serial_port.flush()
-                        time.sleep(0.5)
-                        serial_port.write(b"\r\nNO CARRIER\r\n")
-                        serial_port.flush()
-                        break
-                    
-                    if DEBUG:
-                        _debug_ppp_protocols(data, "Server")
-                    
-                    try:
-                        serial_port.write(data)
-                        serial_port.flush()
-                    except Exception as e:
-                        logging.error(f"Failed to write to serial port: {e}")
-                        break
-                    
-                    time.sleep(0.001)
-                    
-                elif data == b'':
-                    logging.info("Server closed connection")
-                    serial_port.write(b"\r\nNO CARRIER\r\n")
-                    serial_port.flush()
-                    break
-                    
-            except socket.timeout:
-                pass
-            except ConnectionError as e:
-                logging.error(f"Server connection lost: {e}")
-                serial_port.write(b"\r\nNO CARRIER\r\n")
-                serial_port.flush()
-                break
-            except Exception as e:
-                consecutive_errors += 1
-                logging.error(f"Error reading from server ({consecutive_errors}): {e}")
-                if consecutive_errors >= max_consecutive_errors:
-                    break
-            
-            if current_time - last_activity > 300:
-                logging.info("Connection timeout due to inactivity")
-                serial_port.write(b"\r\nNO CARRIER\r\n")
-                serial_port.flush()
-                break
-
-            if not data_handled:
-                idle_count += 1
-                if idle_count < 10:
-                    time.sleep(0.01)
-                elif idle_count < 50:
-                    time.sleep(0.02)
-                else:
-                    time.sleep(0.05)
+            if self.connection_state.in_command_mode:
+                self.logger.info("PPP data bridging ended - returning to command mode")
+                return
             else:
-                idle_count = 0
-                time.sleep(0.002)
-
-    except Exception as e:
-        logging.error(f"Bridge error: {e}")
+                self.logger.info("PPP data bridging ended - disconnecting")
+                self.connection_state.connected = False
+                self.connection_state.in_command_mode = True
+                
+                await socket_transport.close()
+                await serial_transport.write(b"\r\nNO CARRIER\r\n")
+            
+        except Exception as e:
+            self.logger.error(f"PPP data bridging error: {e}")
+            self.connection_state.connected = False
+            self.connection_state.in_command_mode = True
+    
+    async def _bridge_serial_to_socket(self, serial_transport: SerialTransport, socket_transport) -> None:
         try:
-            serial_port.write(b"\r\nNO CARRIER\r\n")
-            serial_port.flush()
-        except:
-            pass
-    finally:
-        logging.info(f"PPP bridge session ended ({platform_name})")
-
-    return "DISCONNECT"
-
-def _debug_ppp_protocols(data, source):
-    if b'\xff\x03\x80\x21' in data:
-        logging.info(f"{source} sent IPCP packet")
-    elif b'\xff\x03\xc0\x21' in data:
-        lcp_start = data.find(b'\xff\x03\xc0\x21')
-        if lcp_start >= 0 and len(data) > lcp_start + 4:
-            lcp_type = data[lcp_start + 4]
-            if lcp_type == 1:
-                logging.info(f"{source} sent LCP Configure-Request")
-            elif lcp_type == 2:
-                logging.info(f"{source} sent LCP Configure-Ack")
-            elif lcp_type == 9:
-                logging.info(f"{source} sent LCP Echo-Request")
-            elif lcp_type == 10:
-                logging.info(f"{source} sent LCP Echo-Reply")
+            self.logger.debug("Starting serial to socket bridge")
+            data_count = 0
+            no_data_count = 0
+            escape_buffer = b""
+            
+            if self.command_processor.compression_enabled:
+                self.compression.enable_compression()
+            
+            while self.connection_state.connected:
+                data = await serial_transport.read()
+                if data:
+                    data_count += 1
+                    no_data_count = 0
+                    
+                    escape_buffer += data
+                    
+                    if b"+++" in escape_buffer:
+                        self.logger.info("Escape sequence detected - entering command mode")
+                        self.connection_state.in_command_mode = True
+                        self.connection_state.connected = False
+                        break
+                    
+                    if len(escape_buffer) > 10:
+                        escape_buffer = escape_buffer[-10:]
+                    
+                    compressed_data = await self.compression.compress_data(data)
+                    
+                    self.logger.debug(f"Serial->Socket #{data_count}: {len(data)} bytes -> {len(compressed_data)} bytes: {data[:20]}...")
+                    await socket_transport.write(compressed_data)
+                else:
+                    no_data_count += 1
+                    if no_data_count % 3000 == 0:
+                        self.logger.warning(f"No serial data for {no_data_count/1000:.1f} seconds")
+                    await asyncio.sleep(0.001)
+                    
+        except Exception as e:
+            self.logger.error(f"Serial to socket bridge error: {e}")
+            raise
+    
+    async def _bridge_socket_to_serial(self, socket_transport, serial_transport: SerialTransport) -> None:
+        try:
+            self.logger.debug("Starting socket to serial bridge")
+            data_count = 0
+            no_data_count = 0
+            
+            while self.connection_state.connected:
+                data = await socket_transport.read()
+                if data:
+                    data_count += 1
+                    no_data_count = 0
+                    
+                    decompressed_data = await self.compression.decompress_data(data)
+                    
+                    self.logger.debug(f"Socket->Serial #{data_count}: {len(data)} bytes -> {len(decompressed_data)} bytes: {data[:20]}...")
+                    await serial_transport.write(decompressed_data)
+                else:
+                    if not await socket_transport.is_connected():
+                        self.logger.info("Socket closed, ending bridge")
+                        self.connection_state.connected = False
+                        break
+                    else:
+                        no_data_count += 1
+                        if no_data_count % 1000 == 0:
+                            self.logger.debug(f"No socket data for {no_data_count/1000:.1f} seconds")
+                        await asyncio.sleep(0.001)
+                    
+        except Exception as e:
+            self.logger.error(f"Socket to serial bridge error: {e}")
+            raise
