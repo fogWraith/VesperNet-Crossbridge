@@ -1,18 +1,18 @@
 # VesperNet PPP Bridge Setup Guide
 
 This guide provides instructions for setting up and running the VesperNet PPP Bridge on Linux, macOS, and Windows systems.  
-The bridge allows vintage computers / emulated environments to connect to the VesperNet PPP service for an authentic dial-up internet experiences.
+The bridge allows vintage computers / emulated environments to connect to the VesperNet PPP service for an authentic dial-up internet experience.
 
 ## System Requirements
 
 ### Linux/macOS
-- Python 3.6 or newer
+- Python 3.8 or newer
 - Physical serial port or USB-to-Serial adapter
 - or
-- PPP support in the OS (pre-installed on most Linux distributions and macOS)
+- For emulation: PTY / TCP Socket / Unix Socket
 
 ### Windows
-- Python 3.6 or newer
+- Python 3.8 or newer
 - Physical serial port or USB-to-Serial adapter
 - or
 - For emulation: Null-modem emulator (com0com, com2tcp, or similar)
@@ -77,6 +77,18 @@ pip install pyserial
 pip install pyserial
 ```
 
+## Installing Optional Packages
+
+With your virtual environment activated, install the optional packages:
+
+```bash
+# For Linux/macOS
+pip install uvloop
+
+# For Windows
+pip install winloop
+```
+
 ## Bridge Configuration
 
 0. Modify the supplied bridge-config.json and keep it next to crossbridge.py - or continue with steps 1 and 2 below.
@@ -99,7 +111,7 @@ pip install pyserial
    {
        "username": "your_username",
        "password": "your_password",
-       "server_host": "49.12.195.38",
+       "server_host": "5.75.159.139",
        "server_port": 6060,
        "device": "/dev/ttyUSB0",
        "baud_rate": 38400,
@@ -116,9 +128,11 @@ pip install pyserial
 
 ## Running the Bridge
 
-### Direct Bridge Mode (No Modem Emulation)
+### Modem Emulation / Direct Bridge Mode (No Modem Emulation)
 
-This mode is suitable when connecting directly to a computer that has PPP client software:
+Direct bridge mode is suitable when connecting directly to a computer that has PPP client software, while modem emulation mode is for vintage hardware / emulated environments that expect to dial in. Adjust the bridge-config.json accordingly.
+
+For Direct Bridge Mode, set `emulate_modem` to `false` in the bridge-config.json file, or `true` to emulate a modem.
 
 ```bash
 # Linux/macOS
@@ -130,40 +144,6 @@ python crossbridge.py
 cd %USERPROFILE%\vespernet
 .venv\Scripts\activate
 python crossbridge.py
-```
-
-### With Modem Emulation
-
-This mode emulates a modem with AT commands for vintage hardware / emulated environments that expect to dial in:
-
-```bash
-# Linux/macOS
-cd ~/vespernet
-source .venv/bin/activate
-python crossbridge.py -e
-
-# Windows
-cd %USERPROFILE%\vespernet
-.venv\Scripts\activate
-python crossbridge.py -e
-```
-
-### Command Line Options
-
-The bridge supports various command-line options:
-
-```
--d, --device      Serial device path (e.g., /dev/ttyUSB0 or COM3)
--b, --baud        Baud rate (default: 38400)
--s, --speed       Modem connection speed (default: 33600)
--e, --emulate     Enable modem emulation with AT commands
--u, --username    Username for authentication
--p, --password    Password for authentication
--c, --config      Path to configuration file
--v, --verbose     Enable verbose logging
--r, --retries     Number of connection retries
--t, --timeout     Inactivity timeout in seconds
--l, --log         Log file path
 ```
 
 ## Windows-Specific Setup for Emulation
@@ -185,7 +165,7 @@ When using modem emulation on Windows, you'll need a null-modem emulator to crea
 
 5. Run the bridge with modem emulation enabled:
    ```cmd
-   python crossbridge.py -e
+   python crossbridge.py
    ```
 
 6. Your vintage hardware can now dial using standard AT commands (e.g., `ATDT`)
