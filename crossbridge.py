@@ -170,7 +170,7 @@ class TransportType(Enum):
 @dataclass
 class BridgeConfig:
     bridge_config: PPPBridgeConfig
-    buffer_size: int = 8192
+    buffer_size: int = 16384
     read_timeout: float = 0.1
     write_timeout: float = 5.0
     heartbeat_interval: float = 30.0
@@ -249,12 +249,38 @@ class SocketTransport:
             raise RuntimeError("Transport not connected")
         
         try:
-            self.writer.write(data)
-            await asyncio.wait_for(
-                self.writer.drain(),
-                timeout=self.config.write_timeout
-            )
-            return len(data)
+            if len(data) < 8192:
+                self.writer.write(data)
+                await asyncio.wait_for(
+                    self.writer.drain(),
+                    timeout=self.config.write_timeout
+                )
+                return len(data)
+            
+            chunk_size = 8192
+            bytes_written = 0
+            
+            for i in range(0, len(data), chunk_size):
+                chunk = data[i:i + chunk_size]
+                self.writer.write(chunk)
+                
+                try:
+                    await asyncio.wait_for(
+                        self.writer.drain(),
+                        timeout=self.config.write_timeout
+                    )
+                except asyncio.TimeoutError:
+                    try:
+                        await asyncio.wait_for(
+                            self.writer.drain(),
+                            timeout=self.config.write_timeout * 2
+                        )
+                    except asyncio.TimeoutError:
+                        raise TimeoutError("Write timeout on transfer")
+                
+                bytes_written += len(chunk)
+            
+            return bytes_written
             
         except asyncio.TimeoutError:
             raise TimeoutError("Write timeout")
@@ -480,17 +506,27 @@ class PPPBridge:
             no_data_count = 0
             
             while self.running:
-                data = await serial_transport.read()
-                if data:
-                    data_count += 1
-                    no_data_count = 0
-                    self.logger.debug(f"Serial->Socket #{data_count}: {len(data)} bytes: {data[:20]}...")
-                    await socket_transport.write(data)
-                else:
-                    no_data_count += 1
-                    if no_data_count % 3000 == 0:
-                        self.logger.debug(f"No serial data for {no_data_count/1000:.1f} seconds")
-                    await asyncio.sleep(0.001)
+                try:
+                    data = await serial_transport.read()
+                    if data:
+                        data_count += 1
+                        no_data_count = 0
+                        self.logger.debug(f"Serial->Socket #{data_count}: {len(data)} bytes: {data[:20]}...")
+                        await socket_transport.write(data)
+                    else:
+                        no_data_count += 1
+                        if no_data_count % 3000 == 0:
+                            self.logger.debug(f"No serial data for {no_data_count/1000:.1f} seconds")
+                        await asyncio.sleep(0.001)
+                        
+                except Exception as e:
+                    if "semaphore timeout" in str(e).lower() or "winerror 121" in str(e).lower():
+                        self.logger.warning("Semaphore timeout detected, applying brief flow control...")
+                        await asyncio.sleep(0.01)
+                        continue
+                    else:
+                        self.logger.error(f"Serial->Socket error: {e}")
+                        raise
                     
         except Exception as e:
             self.logger.debug(f"Serial to socket bridge ended: {e}")
@@ -501,21 +537,31 @@ class PPPBridge:
             no_data_count = 0
             
             while self.running:
-                data = await socket_transport.read()
-                if data:
-                    data_count += 1
-                    no_data_count = 0
-                    self.logger.debug(f"Socket->Serial #{data_count}: {len(data)} bytes: {data[:20]}...")
-                    await serial_transport.write(data)
-                else:
-                    if not await socket_transport.is_connected():
-                        self.logger.info("Socket closed, ending bridge")
-                        break
+                try:
+                    data = await socket_transport.read()
+                    if data:
+                        data_count += 1
+                        no_data_count = 0
+                        self.logger.debug(f"Socket->Serial #{data_count}: {len(data)} bytes: {data[:20]}...")
+                        await serial_transport.write(data)
                     else:
-                        no_data_count += 1
-                        if no_data_count % 1000 == 0:
-                            self.logger.debug(f"No socket data for {no_data_count/1000:.1f} seconds")
-                        await asyncio.sleep(0.001)
+                        if not await socket_transport.is_connected():
+                            self.logger.info("Socket closed, ending bridge")
+                            break
+                        else:
+                            no_data_count += 1
+                            if no_data_count % 1000 == 0:
+                                self.logger.debug(f"No socket data for {no_data_count/1000:.1f} seconds")
+                            await asyncio.sleep(0.001)
+                            
+                except Exception as e:
+                    if "semaphore timeout" in str(e).lower() or "winerror 121" in str(e).lower():
+                        self.logger.warning("Semaphore timeout detected, applying brief flow control...")
+                        await asyncio.sleep(0.01)
+                        continue
+                    else:
+                        self.logger.error(f"Socket->Serial error: {e}")
+                        raise
                     
         except Exception as e:
             self.logger.debug(f"Socket to serial bridge ended: {e}")
@@ -523,7 +569,7 @@ class PPPBridge:
 def create_bridge_config(bridge_config: PPPBridgeConfig) -> BridgeConfig:
     return BridgeConfig(
         bridge_config=bridge_config,
-        buffer_size=8192,
+        buffer_size=16384,
         read_timeout=0.1,
         write_timeout=5.0,
         heartbeat_interval=30.0,
@@ -571,7 +617,7 @@ if __name__ == "__main__":
         )
     
     try:
-        logging.info("VesperNet PPP Bridge v2.0.0 starting")
+        logging.info("VesperNet PPP Bridge v2.0.1 starting")
         runner = EventLoopRunner()
         result = runner.run_loop(main())
         sys.exit(result)
