@@ -40,6 +40,7 @@ class SerialConfig:
     device: str
     baud_rate: int = 38400
     timeout: float = 0.1
+    write_timeout: float = 5.0
     connection_type: SerialConnectionType = SerialConnectionType.PHYSICAL
 
 class SerialConnectionInterface(ABC):
@@ -64,9 +65,10 @@ class SerialConnectionInterface(ABC):
         pass
 
 class UnixSocketConnection(SerialConnectionInterface):
-    def __init__(self, socket_path: str, timeout: float = 0.1):
+    def __init__(self, socket_path: str, read_timeout: float = 0.1, write_timeout: float = 5.0):
         self.socket_path = socket_path
-        self.timeout = timeout
+        self.read_timeout = read_timeout
+        self.write_timeout = write_timeout
         self.sock = None
         self.is_closed = False
         self.logger = logging.getLogger(__name__)
@@ -78,7 +80,7 @@ class UnixSocketConnection(SerialConnectionInterface):
                 raise FileNotFoundError(f"Unix socket path does not exist: {self.socket_path}")
             
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(self.timeout)
+            self.sock.settimeout(self.read_timeout)
             self.sock.connect(self.socket_path)
             self.is_closed = False
             self.logger.info(f"Unix socket serial connection opened: {self.socket_path}")
@@ -145,7 +147,18 @@ class UnixSocketConnection(SerialConnectionInterface):
             return 0
         
         try:
-            return self.sock.send(data)
+            original_timeout = self.sock.gettimeout()
+            self.sock.settimeout(self.write_timeout)
+            
+            try:
+                bytes_sent = self.sock.send(data)
+                return bytes_sent
+            finally:
+                self.sock.settimeout(original_timeout)
+                
+        except socket.timeout:
+            self.logger.warning(f"Unix socket write timeout after {self.write_timeout}s, continuing...")
+            return 0
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
             self.logger.info(f"Unix socket connection lost during write: {e}")
             self.close()
@@ -169,12 +182,12 @@ class UnixSocketConnection(SerialConnectionInterface):
                 self.sock = None
                 self.is_closed = True
 
-
 class TCPSocketConnection(SerialConnectionInterface):
-    def __init__(self, host: str, port: int, timeout: float = 0.1):
+    def __init__(self, host: str, port: int, read_timeout: float = 0.1, write_timeout: float = 5.0):
         self.host = host
         self.port = port
-        self.timeout = timeout
+        self.read_timeout = read_timeout
+        self.write_timeout = write_timeout
         self.sock = None
         self.is_closed = False
         self.logger = logging.getLogger(__name__)
@@ -183,7 +196,7 @@ class TCPSocketConnection(SerialConnectionInterface):
     def _connect(self):
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(self.timeout)
+            self.sock.settimeout(self.read_timeout)
             self.sock.connect((self.host, self.port))
             self.is_closed = False
             self.logger.info(f"TCP socket serial connection opened: {self.host}:{self.port}")
@@ -247,7 +260,18 @@ class TCPSocketConnection(SerialConnectionInterface):
             return 0
         
         try:
-            return self.sock.send(data)
+            original_timeout = self.sock.gettimeout()
+            self.sock.settimeout(self.write_timeout)
+            
+            try:
+                bytes_sent = self.sock.send(data)
+                return bytes_sent
+            finally:
+                self.sock.settimeout(original_timeout)
+                
+        except socket.timeout:
+            self.logger.warning(f"TCP socket write timeout after {self.write_timeout}s, continuing...")
+            return 0
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
             self.logger.info(f"TCP socket connection lost during write: {e}")
             self.close()
@@ -279,10 +303,11 @@ class TCPSocketConnection(SerialConnectionInterface):
                 self.is_closed = True
 
 class PhysicalSerialConnection(SerialConnectionInterface):
-    def __init__(self, device: str, baud_rate: int = 38400, timeout: float = 0.1):
+    def __init__(self, device: str, baud_rate: int = 38400, read_timeout: float = 0.1, write_timeout: float = 5.0):
         self.device = device
         self.baud_rate = baud_rate
-        self.timeout = timeout
+        self.read_timeout = read_timeout
+        self.write_timeout = write_timeout
         self.serial_port = None
         self.logger = logging.getLogger(__name__)
         self._connect()
@@ -295,7 +320,8 @@ class PhysicalSerialConnection(SerialConnectionInterface):
             self.serial_port = pyserial.Serial(
                 port=self.device,
                 baudrate=self.baud_rate,
-                timeout=self.timeout
+                timeout=self.read_timeout,
+                write_timeout=self.write_timeout
             )
             self.logger.info(f"Physical serial connection opened: {self.device}")
             
@@ -345,11 +371,15 @@ class PhysicalSerialConnection(SerialConnectionInterface):
         if not self.serial_port:
             return 0
         
+        original_timeout = self.serial_port.timeout
         try:
+            self.serial_port.timeout = self.write_timeout
             return self.serial_port.write(data)
         except Exception as e:
             self.logger.error(f"Serial write error: {e}")
             return 0
+        finally:
+            self.serial_port.timeout = original_timeout
     
     def flush(self) -> None:
         if self.serial_port:
@@ -411,9 +441,9 @@ class SerialConnectionFactory:
     def create_connection(config: SerialConfig) -> SerialConnectionInterface:
         if config.connection_type == SerialConnectionType.UNIX_SOCKET:
             socket_path = config.device.replace('unix:', '')
-            return UnixSocketConnection(socket_path, config.timeout)
+            return UnixSocketConnection(socket_path, config.timeout, config.write_timeout)
         elif config.connection_type == SerialConnectionType.PHYSICAL:
-            return PhysicalSerialConnection(config.device, config.baud_rate, config.timeout)
+            return PhysicalSerialConnection(config.device, config.baud_rate, config.timeout, config.write_timeout)
         elif config.connection_type == SerialConnectionType.TCP_SOCKET:
             tcp_parts = config.device.replace('tcp:', '').split(':')
             if len(tcp_parts) != 2:
@@ -423,12 +453,12 @@ class SerialConnectionFactory:
                 port = int(tcp_parts[1])
             except ValueError:
                 raise ValueError(f"Invalid port number in TCP socket: {config.device}")
-            return TCPSocketConnection(host, port, config.timeout)
+            return TCPSocketConnection(host, port, config.timeout, config.write_timeout)
         else:
             raise ValueError(f"Unsupported connection type: {config.connection_type}")
 
 class SerialTransport:
-    def __init__(self, buffer_size: int = 8192, read_timeout: float = 0.1, write_timeout: float = 5.0):
+    def __init__(self, buffer_size: int = 16384, read_timeout: float = 0.1, write_timeout: float = 5.0):
         self.buffer_size = buffer_size
         self.read_timeout = read_timeout
         self.write_timeout = write_timeout
@@ -458,6 +488,7 @@ class SerialTransport:
                 device=device,
                 baud_rate=baud_rate,
                 timeout=self.read_timeout,
+                write_timeout=self.write_timeout,
                 connection_type=connection_type
             )
             
@@ -545,10 +576,12 @@ class SerialTransport:
                     )
                     
                     if bytes_written == 0 and len(data) > 0:
-                        self.logger.info("Serial write failed, connection may be lost")
                         if not self.serial_connection.is_connected():
+                            self.logger.info("Serial write failed, connection lost")
                             self.connected = False
                             break
+                        else:
+                            self.logger.warning("Serial write timeout, but connection still active")
                     
                     await loop.run_in_executor(
                         self._executor,
