@@ -14,53 +14,75 @@
 #   You should have received a copy of the GNU General Public License
 #   along with this program.  If not, see <https://www.gnu.org/licenses/>.
 ###
+from __future__ import annotations
+
 import os
 import sys
 import asyncio
 import logging
 import json
-from typing import Optional
+from typing import Optional, TYPE_CHECKING, Any
 from dataclasses import dataclass
 from enum import Enum
 
-def check_required_modules():
+class MissingDependencyError(ImportError):
+    pass
+
+SerialTransport = None
+ModemEmulator = None
+ModemConfig = None
+
+if TYPE_CHECKING:
+    from serial_utils import SerialTransport as SerialTransportProtocol
+    from modem_utils import ModemEmulator as ModemEmulatorProtocol, ModemConfig as ModemConfigProtocol
+else:
+    SerialTransportProtocol = Any
+    ModemEmulatorProtocol = Any
+    ModemConfigProtocol = Any
+
+def check_required_modules() -> None:
+    global SerialTransport, ModemEmulator, ModemConfig
+
     missing_modules = []
-    
+
     try:
-        from modem_utils import ModemEmulator, ModemConfig
+        from modem_utils import ModemEmulator as _ModemEmulator, ModemConfig as _ModemConfig
     except ImportError as e:
         missing_modules.append(("modem_utils.py", "ModemEmulator, ModemConfig", str(e)))
-    
+    else:
+        ModemEmulator = _ModemEmulator
+        ModemConfig = _ModemConfig
+
     try:
-        from serial_utils import SerialTransport
+        from serial_utils import SerialTransport as _SerialTransport
     except ImportError as e:
         missing_modules.append(("serial_utils.py", "SerialTransport", str(e)))
-    
+    else:
+        SerialTransport = _SerialTransport
+
     if missing_modules:
-        print("=" * 60)
-        print("ERROR: Missing Required VesperNet Modules")
-        print("=" * 60)
-        print()
+        message_lines = ["","=" * 60,
+                         "Missing Required VesperNet Modules",
+                         "=" * 60,
+                         ""]
         for module_file, components, error in missing_modules:
-            print(f"• Missing: {module_file}")
-            print(f"  Components: {components}")
-            print(f"  Error: {error}")
-            print()
-        
-        print("SOLUTION:")
-        print("  1. Download the complete VesperNet PPP Bridge package")
-        print("  2. Ensure all .py files are in the same directory")
-        print("  3. Required files: crossbridge.py, modem_utils.py, serial_utils.py")
-        print()
-        print("Get the complete package from:")
-        print("  https://github.com/fogWraith/VesperNet-Crossbridge")
-        print("=" * 60)
-        sys.exit(1)
+            message_lines.append(f"• Missing: {module_file}")
+            message_lines.append(f"  Components: {components}")
+            message_lines.append(f"  Error: {error}")
+            message_lines.append("")
 
-check_required_modules()
+        message_lines.extend([
+            "SOLUTION:",
+            "  1. Download the complete VesperNet PPP Bridge package",
+            "  2. Ensure all .py files are in the same directory",
+            "  3. Required files: crossbridge.py, modem_utils.py, serial_utils.py",
+            "",
+            "Get the complete package from:",
+            "  https://github.com/fogWraith/VesperNet-Crossbridge",
+            "=" * 60,
+        ])
 
-from serial_utils import SerialTransport
-from modem_utils import ModemEmulator, ModemConfig
+        raise MissingDependencyError("\n".join(message_lines))
 
 class EventLoopRunner:
     def __init__(self):
@@ -92,10 +114,8 @@ class EventLoopRunner:
                     return run(main_coro)
                 except Exception as e:
                     self.logger.debug(f"Failed to use winloop: {e}")
-            
-            self.logger.info("Using WindowsProactorEventLoopPolicy")
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-            return asyncio.run(main_coro)
+
+            return self._run_windows(main_coro)
         else:
             if self.uvloop_available:
                 try:
@@ -104,8 +124,25 @@ class EventLoopRunner:
                     return run(main_coro)
                 except Exception as e:
                     self.logger.debug(f"Failed to use uvloop: {e}")
-            
+
             self.logger.info("Using standard asyncio event loop")
+            return asyncio.run(main_coro)
+
+    def _run_windows(self, main_coro):
+        python_version = sys.version_info
+        if python_version >= (3, 14):
+            self.logger.info("Using asyncio.Runner")
+            policy = asyncio.WindowsProactorEventLoopPolicy()
+            loop_factory = policy.new_event_loop
+            try:
+                with asyncio.Runner(loop_factory=loop_factory) as runner:
+                    return runner.run(main_coro)
+            except Exception as e:
+                self.logger.error(f"Runner execution failed: {e}")
+                raise
+        else:
+            self.logger.info("Using WindowsProactorEventLoopPolicy")
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
             return asyncio.run(main_coro)
 
 @dataclass
@@ -312,6 +349,7 @@ class SocketTransport:
 
 class PPPBridge:
     def __init__(self, config: BridgeConfig):
+        check_required_modules()
         self.config = config
         self.bridge_config = config.bridge_config
         self.logger = logging.getLogger(__name__)
@@ -473,7 +511,7 @@ class PPPBridge:
             self.logger.error(f"Speed negotiation failed: {e}")
             return False
     
-    async def _bridge_connections(self, serial_transport: SerialTransport, socket_transport: SocketTransport) -> None:
+    async def _bridge_connections(self, serial_transport: SerialTransportProtocol, socket_transport: SocketTransport) -> None:
         try:
             serial_to_socket_task = asyncio.create_task(
                 self._bridge_serial_to_socket(serial_transport, socket_transport)
@@ -500,7 +538,7 @@ class PPPBridge:
         except Exception as e:
             self.logger.error(f"Bridge connections error: {e}")
     
-    async def _bridge_serial_to_socket(self, serial_transport: SerialTransport, socket_transport: SocketTransport) -> None:
+    async def _bridge_serial_to_socket(self, serial_transport: SerialTransportProtocol, socket_transport: SocketTransport) -> None:
         try:
             data_count = 0
             no_data_count = 0
@@ -531,7 +569,7 @@ class PPPBridge:
         except Exception as e:
             self.logger.debug(f"Serial to socket bridge ended: {e}")
     
-    async def _bridge_socket_to_serial(self, socket_transport: SocketTransport, serial_transport: SerialTransport) -> None:
+    async def _bridge_socket_to_serial(self, socket_transport: SocketTransport, serial_transport: SerialTransportProtocol) -> None:
         try:
             data_count = 0
             no_data_count = 0
@@ -581,6 +619,8 @@ def create_bridge_config(bridge_config: PPPBridgeConfig) -> BridgeConfig:
 
 async def main():
     try:
+        check_required_modules()
+
         config_manager = ConfigurationManager(is_windows=sys.platform.startswith('win'))
         bridge_config = config_manager.load_config()
         
@@ -593,6 +633,9 @@ async def main():
         else:
             return await bridge.run_direct_bridge()
             
+    except MissingDependencyError as exc:
+        logging.error(str(exc))
+        return 1
     except Exception as e:
         logging.error(f"Bridge failed: {e}")
         return 1
@@ -602,25 +645,34 @@ if __name__ == "__main__":
         config_manager = ConfigurationManager(is_windows=sys.platform.startswith('win'))
         bridge_config = config_manager.load_config()
         debug_enabled = bridge_config.debug
+        log_file = bridge_config.log_file
     except Exception:
         debug_enabled = False
+        log_file = None
     
-    if debug_enabled:
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-        )
+    log_level = logging.DEBUG if debug_enabled else logging.INFO
+    log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s" if debug_enabled else "[%(levelname)s] %(message)s"
+
+    log_handlers = [logging.StreamHandler()]
+    if log_file:
+        try:
+            log_handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        except Exception as log_exc:
+            logging.basicConfig(level=log_level, format=log_format)
+            logging.getLogger(__name__).warning(f"Failed to open log file {log_file}: {log_exc}")
+        else:
+            logging.basicConfig(level=log_level, format=log_format, handlers=log_handlers)
     else:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="[%(levelname)s] %(message)s"
-        )
+        logging.basicConfig(level=log_level, format=log_format)
     
     try:
-        logging.info("VesperNet PPP Bridge v2.0.1 starting")
+        logging.info("VesperNet PPP Bridge v2.0.2 starting")
         runner = EventLoopRunner()
         result = runner.run_loop(main())
         sys.exit(result)
+    except MissingDependencyError as exc:
+        logging.error(str(exc))
+        sys.exit(1)
     except KeyboardInterrupt:
         logging.info("Interrupted by user")
         sys.exit(0)
