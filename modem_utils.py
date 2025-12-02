@@ -118,26 +118,31 @@ class CommandProcessor:
         self.dtr_action = 2
         self.dcd_action = 0
         
+        # S-registers
         self.s_registers = {
-            0: 0,
-            1: 0,
-            2: 43,
-            3: 13,
-            4: 10,
-            5: 8,
-            6: 2,
-            7: 50,
-            8: 2,
-            9: 6,
-            10: 14,
-            11: 95,
-            12: 50,
+            0: 0,   # Auto-answer ring count
+            1: 0,   # Ring counter
+            2: 43,  # Escape character (+)
+            3: 13,  # Carriage return character
+            4: 10,  # Line feed character
+            5: 8,   # Backspace character
+            6: 2,   # Wait time before dialing
+            7: 50,  # Connection timeout
+            8: 2,   # Comma pause time
+            9: 6,   # Carrier detect response time
+            10: 14, # Carrier loss timeout
+            11: 95, # DTMF tone duration
+            12: 50, # Escape guard time
         }
         
         self.signal_strength = random.randint(85, 100)
         self.line_quality = random.randint(92, 100)
         self.connection_type = self._determine_connection_type(connect_speed)
         self.last_connect_speed = connect_speed
+
+    def get_escape_guard_time(self) -> float:
+        value = self.s_registers.get(12, 50)
+        return max(0, value) / 50.0
     
     def _determine_connection_type(self, speed: int) -> str:
         if speed <= 9600:
@@ -178,7 +183,7 @@ class CommandProcessor:
                 return True
             
             elif command == "ATI" or command == "ATI0":
-                await self._send_response(serial_transport, "VesperNet PPP Bridge v2.0.0")
+                await self._send_response(serial_transport, "VesperNet PPP Bridge v2.0.2")
                 await self._send_response(serial_transport, "OK")
                 return True
             elif command == "ATI1":
@@ -190,7 +195,7 @@ class CommandProcessor:
                 await self._send_response(serial_transport, "OK")
                 return True
             elif command == "ATI3":
-                await self._send_response(serial_transport, f"VesperNet PPP Bridge v2.0.0 - Signal: {self.signal_strength}%")
+                await self._send_response(serial_transport, f"VesperNet PPP Bridge v2.0.2 - Signal: {self.signal_strength}%")
                 await self._send_response(serial_transport, "OK")
                 return True
             elif command == "ATI4":
@@ -316,7 +321,7 @@ class CommandProcessor:
                 return True
             
             elif command == "AT+CGMR":
-                await self._send_response(serial_transport, "2.0.0")
+                await self._send_response(serial_transport, "2.0.2")
                 await self._send_response(serial_transport, "OK")
                 return True
             
@@ -401,9 +406,9 @@ class CommandProcessor:
         self.dtr_action = 2
         self.dcd_action = 0
         self.s_registers.update({
-            0: 0,
-            7: 50,
-            12: 50,
+            0: 0,   # Auto-answer
+            7: 50,  # Connection timeout
+            12: 50, # Escape guard time
         })
         self.logger.debug("Modem settings reset to defaults")
     
@@ -412,6 +417,67 @@ class CommandProcessor:
         self.compression_enabled = False
         self.error_correction_enabled = False
         self.logger.info("Modem reset to factory defaults")
+
+class S12Handler:
+    def __init__(self, command_processor: CommandProcessor):
+        self.command_processor = command_processor
+        self.last_data_time: Optional[float] = None
+        self.armed = False
+        self.pending = False
+        self.pending_since: Optional[float] = None
+        self.pending_buffer: bytes = b""
+
+    def _guard_time_seconds(self) -> float:
+        return self.command_processor.get_escape_guard_time()
+
+    def handle_data(self, chunk: bytes, now: float) -> tuple[bytes, bool]:
+        guard_time = self._guard_time_seconds()
+        self.last_data_time = now
+
+        if guard_time == 0:
+            self.armed = True
+
+        if self.pending:
+            if guard_time == 0 or now - (self.pending_since or now) < guard_time:
+                restored = self._cancel_pending_buffer() + chunk
+                self.armed = False
+                return restored, False
+
+        if self.armed and chunk == b'+++':
+            if guard_time == 0:
+                self.armed = False
+                return b"", True
+            self.pending = True
+            self.pending_since = now
+            self.pending_buffer = b'+++'
+            self.armed = False
+            return b"", False
+
+        self.armed = False
+        return chunk, False
+
+    def handle_idle(self, now: float) -> bool:
+        guard_time = self._guard_time_seconds()
+        if self.pending:
+            if guard_time == 0 or now - (self.pending_since or now) >= guard_time:
+                self._cancel_pending_buffer()
+                return True
+            return False
+
+        if guard_time == 0:
+            self.armed = True
+            return False
+
+        if self.last_data_time is not None and (now - self.last_data_time) >= guard_time:
+            self.armed = True
+        return False
+
+    def _cancel_pending_buffer(self) -> bytes:
+        data = self.pending_buffer
+        self.pending_buffer = b""
+        self.pending = False
+        self.pending_since = None
+        return data
 
 class ModemEmulator:
     def __init__(self, modem_config: ModemConfig, is_windows: bool = False):
@@ -782,33 +848,37 @@ class ModemEmulator:
             self.logger.debug("Starting serial to socket bridge")
             data_count = 0
             no_data_count = 0
-            escape_buffer = b""
+            escape_detector = S12Handler(self.command_processor)
+            loop = asyncio.get_event_loop()
             
             if self.command_processor.compression_enabled:
                 self.compression.enable_compression()
             
             while self.connection_state.connected:
                 data = await serial_transport.read()
+                now = loop.time()
                 if data:
                     data_count += 1
                     no_data_count = 0
-                    
-                    escape_buffer += data
-                    
-                    if b"+++" in escape_buffer:
+                    processed_data, escape_triggered = escape_detector.handle_data(data, now)
+                    if escape_triggered:
                         self.logger.info("Escape sequence detected - entering command mode")
                         self.connection_state.in_command_mode = True
                         self.connection_state.connected = False
                         break
-                    
-                    if len(escape_buffer) > 10:
-                        escape_buffer = escape_buffer[-10:]
-                    
-                    compressed_data = await self.compression.compress_data(data)
-                    
-                    self.logger.debug(f"Serial->Socket #{data_count}: {len(data)} bytes -> {len(compressed_data)} bytes: {data[:20]}...")
+                    if not processed_data:
+                        continue
+                    compressed_data = await self.compression.compress_data(processed_data)
+                    self.logger.debug(
+                        f"Serial->Socket #{data_count}: {len(processed_data)} bytes -> {len(compressed_data)} bytes: {processed_data[:20]}..."
+                    )
                     await socket_transport.write(compressed_data)
                 else:
+                    if escape_detector.handle_idle(now):
+                        self.logger.info("Escape sequence detected - entering command mode")
+                        self.connection_state.in_command_mode = True
+                        self.connection_state.connected = False
+                        break
                     no_data_count += 1
                     if no_data_count % 3000 == 0:
                         self.logger.warning(f"No serial data for {no_data_count/1000:.1f} seconds")
